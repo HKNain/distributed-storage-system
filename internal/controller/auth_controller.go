@@ -137,6 +137,7 @@ func (ac *AuthController) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	// Generate JWT.
 	claims := jwt.MapClaims{
+		"user_id":  user.ID,
 		"username": user.Username,
 		"exp":      time.Now().Add(24 * time.Hour).Unix(),
 		"iat":      time.Now().Unix(),

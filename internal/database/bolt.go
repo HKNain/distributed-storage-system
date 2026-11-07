@@ -8,6 +8,8 @@ import (
 )
 
 var UsersBucket = []byte("users")
+var FilesBucket = []byte("files")
+var ChunksBucket = []byte("chunks")
 
 func OpenDB(dbPath string) (*bolt.DB, error) {
 
@@ -23,7 +25,15 @@ func OpenDB(dbPath string) (*bolt.DB, error) {
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
+		// Create the users bucket if it doesn't exist.
 		_, err := tx.CreateBucketIfNotExists(UsersBucket)
+
+		// Create the files bucket if it doesn't exist.
+		_, err = tx.CreateBucketIfNotExists(FilesBucket)
+
+		// Create the chunks bucket if it doesn't exist.
+		_, err = tx.CreateBucketIfNotExists(ChunksBucket)
+		
 		return err
 	})
 

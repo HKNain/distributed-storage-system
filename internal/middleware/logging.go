@@ -1,54 +1,40 @@
 package middleware
 
 import (
+	"log"
 	"net/http"
 	"time"
-
-	"github.com/HKNain/distributed-storage-system/internal/utils"
-
 )
 
-type responseWriter struct {
+type responseRecorder struct {
 	http.ResponseWriter
-	status int
+	statusCode int
 }
 
-func (rw *responseWriter) WriteHeader(status int) {
-	rw.status = status
-	rw.ResponseWriter.WriteHeader(status)
-}
-
-func (rw *responseWriter) Write(data []byte) (int, error) {
-	if rw.status == 0 {
-		rw.status = http.StatusOK
-	}
-
-	return rw.ResponseWriter.Write(data)
+func (r *responseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
+	r.ResponseWriter.WriteHeader(statusCode)
 }
 
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		start := time.Now()
 
-		rw := &responseWriter{
+		recorder := &responseRecorder{
 			ResponseWriter: w,
-			status:         0,
+			statusCode:     http.StatusOK,
 		}
 
-		next.ServeHTTP(rw, r)
-
-		if rw.status == 0 {
-			rw.status = http.StatusOK
-		}
+		next.ServeHTTP(recorder, r)
 
 		duration := time.Since(start)
 
-		logger.LogAPI(
+		log.Printf(
+			"%s %s %d %s",
 			r.Method,
 			r.URL.Path,
-			rw.status,
-			duration.String(),
+			recorder.statusCode,
+			duration,
 		)
 	})
 }
