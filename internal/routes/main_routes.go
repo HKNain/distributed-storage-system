@@ -6,10 +6,7 @@ import (
 	"github.com/HKNain/distributed-storage-system/internal/controller"
 )
 
-func MainRoutes() *http.ServeMux {
-    mux := http.NewServeMux()
-
+func MainRoutes(mux *http.ServeMux)  {
     mux.HandleFunc("/health", controller.HealthHandler)
 
-    return mux
 }
