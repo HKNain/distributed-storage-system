@@ -1,4 +1,3 @@
-
 package repository
 
 import (
@@ -9,6 +8,7 @@ import (
 
 	"github.com/HKNain/distributed-storage-system/internal/database"
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/google/uuid"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -16,6 +16,7 @@ import (
 var (
 	ErrUserExists  = errors.New("username already exists")
 	ErrEmailExists = errors.New("email already registered")
+	ErrIDExists    = errors.New("user ID already exists")
 	ErrUserNotFound = errors.New("user not found")
 )
 
@@ -40,6 +41,11 @@ func (repo *UserRepository) CreateUser(user models.User) error {
 		}
 
 		username := strings.ToLower(user.Username)
+		id, err := generateUniqueUserID(bucket)
+		if err != nil {
+			return err
+		}
+		user.ID = id
 
 		// Check username uniqueness.
 		if bucket.Get([]byte(username)) != nil {
@@ -47,7 +53,7 @@ func (repo *UserRepository) CreateUser(user models.User) error {
 		}
 
 		// Check email uniqueness.
-		err := bucket.ForEach(func(k, v []byte) error {
+		err = bucket.ForEach(func(k, v []byte) error {
 			var existingUser models.User
 
 			if err := json.Unmarshal(v, &existingUser); err != nil {
@@ -141,4 +147,34 @@ func (repo *UserRepository) GetUserByEmail(email string) (models.User, error) {
 	}
 
 	return user, nil
+}
+
+func generateUniqueUserID(bucket *bolt.Bucket) (string, error) {
+    for {
+        id := uuid.NewString()
+
+        var exists bool
+
+        err := bucket.ForEach(func(_, v []byte) error {
+            var existingUser models.User
+
+            if err := json.Unmarshal(v, &existingUser); err != nil {
+                return err
+            }
+
+            if existingUser.ID == id {
+                exists = true
+            }
+
+            return nil
+        })
+
+        if err != nil {
+            return "", err
+        }
+
+        if !exists {
+            return id, nil
+        }
+    }
 }
