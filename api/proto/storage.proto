@@ -14,6 +14,10 @@ service StorageService {
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
+service MasterControlService {
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
 message StoreChunkRequest {
     string chunk_id = 1;
     bytes data = 2;
@@ -46,4 +50,14 @@ message HealthCheckRequest {}
 
 message HealthCheckResponse {
     bool healthy = 1;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string address = 2;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  string message = 2;
 }

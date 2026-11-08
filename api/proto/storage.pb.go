@@ -397,6 +397,110 @@ func (x *HealthCheckResponse) GetHealthy() bool {
 	return false
 }
 
+type HeartbeatRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Address       string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatRequest) Reset() {
+	*x = HeartbeatRequest{}
+	mi := &file_api_proto_storage_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatRequest) ProtoMessage() {}
+
+func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_storage_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_storage_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *HeartbeatRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+type HeartbeatResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatResponse) Reset() {
+	*x = HeartbeatResponse{}
+	mi := &file_api_proto_storage_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResponse) ProtoMessage() {}
+
+func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_storage_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_storage_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *HeartbeatResponse) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *HeartbeatResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_api_proto_storage_proto protoreflect.FileDescriptor
 
 const file_api_proto_storage_proto_rawDesc = "" +
@@ -420,13 +524,21 @@ const file_api_proto_storage_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x14\n" +
 	"\x12HealthCheckRequest\"/\n" +
 	"\x13HealthCheckResponse\x12\x18\n" +
-	"\ahealthy\x18\x01 \x01(\bR\ahealthy2\xac\x02\n" +
+	"\ahealthy\x18\x01 \x01(\bR\ahealthy\"E\n" +
+	"\x10HeartbeatRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x18\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\"I\n" +
+	"\x11HeartbeatResponse\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage2\xac\x02\n" +
 	"\x0eStorageService\x12E\n" +
 	"\n" +
 	"StoreChunk\x12\x1a.storage.StoreChunkRequest\x1a\x1b.storage.StoreChunkResponse\x12?\n" +
 	"\bGetChunk\x12\x18.storage.GetChunkRequest\x1a\x19.storage.GetChunkResponse\x12H\n" +
 	"\vDeleteChunk\x12\x1b.storage.DeleteChunkRequest\x1a\x1c.storage.DeleteChunkResponse\x12H\n" +
-	"\vHealthCheck\x12\x1b.storage.HealthCheckRequest\x1a\x1c.storage.HealthCheckResponseBBZ@github.com/HKNain/distributed-storage-system/api/proto;storagepbb\x06proto3"
+	"\vHealthCheck\x12\x1b.storage.HealthCheckRequest\x1a\x1c.storage.HealthCheckResponse2Z\n" +
+	"\x14MasterControlService\x12B\n" +
+	"\tHeartbeat\x12\x19.storage.HeartbeatRequest\x1a\x1a.storage.HeartbeatResponseBBZ@github.com/HKNain/distributed-storage-system/api/proto;storagepbb\x06proto3"
 
 var (
 	file_api_proto_storage_proto_rawDescOnce sync.Once
@@ -440,7 +552,7 @@ func file_api_proto_storage_proto_rawDescGZIP() []byte {
 	return file_api_proto_storage_proto_rawDescData
 }
 
-var file_api_proto_storage_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_api_proto_storage_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_api_proto_storage_proto_goTypes = []any{
 	(*StoreChunkRequest)(nil),   // 0: storage.StoreChunkRequest
 	(*StoreChunkResponse)(nil),  // 1: storage.StoreChunkResponse
@@ -450,18 +562,22 @@ var file_api_proto_storage_proto_goTypes = []any{
 	(*DeleteChunkResponse)(nil), // 5: storage.DeleteChunkResponse
 	(*HealthCheckRequest)(nil),  // 6: storage.HealthCheckRequest
 	(*HealthCheckResponse)(nil), // 7: storage.HealthCheckResponse
+	(*HeartbeatRequest)(nil),    // 8: storage.HeartbeatRequest
+	(*HeartbeatResponse)(nil),   // 9: storage.HeartbeatResponse
 }
 var file_api_proto_storage_proto_depIdxs = []int32{
 	0, // 0: storage.StorageService.StoreChunk:input_type -> storage.StoreChunkRequest
 	2, // 1: storage.StorageService.GetChunk:input_type -> storage.GetChunkRequest
 	4, // 2: storage.StorageService.DeleteChunk:input_type -> storage.DeleteChunkRequest
 	6, // 3: storage.StorageService.HealthCheck:input_type -> storage.HealthCheckRequest
-	1, // 4: storage.StorageService.StoreChunk:output_type -> storage.StoreChunkResponse
-	3, // 5: storage.StorageService.GetChunk:output_type -> storage.GetChunkResponse
-	5, // 6: storage.StorageService.DeleteChunk:output_type -> storage.DeleteChunkResponse
-	7, // 7: storage.StorageService.HealthCheck:output_type -> storage.HealthCheckResponse
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	8, // 4: storage.MasterControlService.Heartbeat:input_type -> storage.HeartbeatRequest
+	1, // 5: storage.StorageService.StoreChunk:output_type -> storage.StoreChunkResponse
+	3, // 6: storage.StorageService.GetChunk:output_type -> storage.GetChunkResponse
+	5, // 7: storage.StorageService.DeleteChunk:output_type -> storage.DeleteChunkResponse
+	7, // 8: storage.StorageService.HealthCheck:output_type -> storage.HealthCheckResponse
+	9, // 9: storage.MasterControlService.Heartbeat:output_type -> storage.HeartbeatResponse
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -478,9 +594,9 @@ func file_api_proto_storage_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_storage_proto_rawDesc), len(file_api_proto_storage_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_api_proto_storage_proto_goTypes,
 		DependencyIndexes: file_api_proto_storage_proto_depIdxs,

@@ -4,36 +4,47 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
-	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 
 	"github.com/HKNain/distributed-storage-system/internal/chunker"
+	"github.com/HKNain/distributed-storage-system/internal/middleware"
 	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/HKNain/distributed-storage-system/internal/repository"
 	"github.com/HKNain/distributed-storage-system/internal/rpc"
-	"github.com/HKNain/distributed-storage-system/internal/middleware"
+	"github.com/HKNain/distributed-storage-system/internal/wal"
 )
 
 type FileController struct {
-	fileRepo     *repository.FileRepository
-	chunkRepo    *repository.ChunkRepository
-	storageClient *rpc.StorageClient
+	fileRepo       *repository.FileRepository
+	chunkRepo      *repository.ChunkRepository
+	storageClient  *rpc.StorageClient
+	walWriter      *wal.Writer
+	storageNodeID  string
 }
 
-const MaxUploadSize int64 = 10 * 1024 * 1024 * 1024 // 10 GiB
+const (
+	MaxUploadSize int64 = 10 * 1024 * 1024 * 1024
+	StagingDir          = "data/wal/staging"
+)
 
 func NewFileController(
 	fileRepo *repository.FileRepository,
 	chunkRepo *repository.ChunkRepository,
 	storageClient *rpc.StorageClient,
+	walWriter *wal.Writer,
+	storageNodeID string,
 ) *FileController {
 	return &FileController{
 		fileRepo:      fileRepo,
 		chunkRepo:     chunkRepo,
 		storageClient: storageClient,
+		walWriter:     walWriter,
+		storageNodeID: storageNodeID,
 	}
 }
 
@@ -50,43 +61,134 @@ func (c *FileController) UploadFile(
 		return models.File{}, fmt.Errorf("invalid upload parameters")
 	}
 
-	if fileSize < 0 {
+	if fileSize < 0 || fileSize > MaxUploadSize {
 		return models.File{}, fmt.Errorf("invalid file size")
 	}
 
-	// Create initial file metadata.
+	if c.walWriter == nil || c.storageNodeID == "" {
+		return models.File{}, fmt.Errorf("WAL writer or storage node ID is not configured")
+	}
+
 	file, err := c.fileRepo.CreateFile(models.File{
 		UserID:      userID,
 		Name:        fileName,
 		ContentType: contentType,
 		Size:        fileSize,
 	})
-
 	if err != nil {
 		return models.File{}, fmt.Errorf("create file metadata: %w", err)
 	}
 
-	// Calculate the complete file checksum while streaming.
+	// Stage the complete source file before beginning WAL-tracked writes.
+	if err := os.MkdirAll(StagingDir, 0755); err != nil {
+		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
+		return models.File{}, fmt.Errorf("create staging directory: %w", err)
+	}
+
+	stagingPath := filepath.Join(StagingDir, file.ID+".upload")
+
+	stagedFile, err := os.OpenFile(
+		stagingPath,
+		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+		0600,
+	)
+	if err != nil {
+		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
+		return models.File{}, fmt.Errorf("create staging file: %w", err)
+	}
+
 	hasher := sha256.New()
-	reader = io.TeeReader(reader, hasher)
+
+	written, copyErr := io.Copy(
+		io.MultiWriter(stagedFile, hasher),
+		io.LimitReader(reader, fileSize+1),
+	)
+
+	syncErr := stagedFile.Sync()
+	closeErr := stagedFile.Close()
+
+	if copyErr != nil || syncErr != nil || closeErr != nil {
+		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
+		return models.File{}, fmt.Errorf(
+			"stage upload: copy=%v sync=%v close=%v",
+			copyErr, syncErr, closeErr,
+		)
+	}
+
+	if written != fileSize {
+		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
+		return models.File{}, fmt.Errorf(
+			"file size mismatch: expected %d bytes, received %d",
+			fileSize, written,
+		)
+	}
+
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+
+	// Record the upload only after its staging file is durable.
+	if err := c.walWriter.Append(models.Record{
+		Event:       models.EventUploadStarted,
+		FileID:      file.ID,
+		StagingPath: stagingPath,
+		FileSize:    fileSize,
+	}); err != nil {
+		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
+		return models.File{}, fmt.Errorf("write upload-started WAL record: %w", err)
+	}
+
+	failUpload := func(cause error) (models.File, error) {
+		walErr := c.walWriter.Append(models.Record{
+			Event:  models.EventUploadFailed,
+			FileID: file.ID,
+			Error:  cause.Error(),
+		})
+
+		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
+
+		if walErr != nil {
+			return models.File{}, fmt.Errorf(
+				"%w (also failed to record upload failure in WAL: %v)",
+				cause, walErr,
+			)
+		}
+
+		return models.File{}, cause
+	}
+
+	stagedReader, err := os.Open(stagingPath)
+	if err != nil {
+		return failUpload(fmt.Errorf("open staged upload: %w", err))
+	}
+	defer stagedReader.Close()
 
 	chunkCount := 0
 
-	// Process one chunk at a time.
-	err = chunker.Process(reader, file.ID, func(chunk chunker.ChunkData) error {
-
-		// Step 1: Create pending chunk metadata.
+	err = chunker.Process(stagedReader, file.ID, func(chunk chunker.ChunkData) error {
 		metadata, err := c.chunkRepo.CreateChunk(chunk.Metadata)
 		if err != nil {
 			return fmt.Errorf("create chunk metadata: %w", err)
 		}
 
-		// Step 2: Send actual bytes to the storage node.
+		// WAL intent must be durable before sending bytes to the node.
+		startRecord := models.Record{
+			Event:       models.EventChunkWriteStarted,
+			FileID:      file.ID,
+			ChunkID:     metadata.ID,
+			ChunkIndex:  metadata.Index,
+			ChunkSize:   metadata.Size,
+			Checksum:    metadata.Hash,
+			NodeID:      c.storageNodeID,
+		}
+
+		if err := c.walWriter.Append(startRecord); err != nil {
+			return fmt.Errorf("write chunk-started WAL record: %w", err)
+		}
+
 		err = c.storageClient.StoreChunk(
 			ctx,
 			metadata.ID,
 			chunk.Data,
-			chunk.Metadata.Hash,
+			metadata.Hash,
 		)
 
 		if err != nil {
@@ -95,52 +197,74 @@ func (c *FileController) UploadFile(
 				models.ChunkStatusFailed,
 			)
 
-			return fmt.Errorf("store chunk %d: %w", chunk.Metadata.Index, err)
+			walErr := c.walWriter.Append(models.Record{
+				Event:       models.EventChunkWriteFailed,
+				FileID:      file.ID,
+				ChunkID:     metadata.ID,
+				ChunkIndex:  metadata.Index,
+				ChunkSize:   metadata.Size,
+				Checksum:    metadata.Hash,
+				NodeID:      c.storageNodeID,
+				Error:       err.Error(),
+			})
+
+			if walErr != nil {
+				return fmt.Errorf(
+					"store chunk %d: %w (also failed to record WAL failure: %v)",
+					metadata.Index, err, walErr,
+				)
+			}
+
+			return fmt.Errorf("store chunk %d: %w", metadata.Index, err)
 		}
 
-		// Step 3: Mark chunk as stored.
-		err = c.chunkRepo.UpdateChunkStatus(
+		// Record physical storage success before updating metadata.
+		if err := c.walWriter.Append(models.Record{
+			Event:       models.EventChunkWriteCommitted,
+			FileID:      file.ID,
+			ChunkID:     metadata.ID,
+			ChunkIndex:  metadata.Index,
+			ChunkSize:   metadata.Size,
+			Checksum:    metadata.Hash,
+			NodeID:      c.storageNodeID,
+		}); err != nil {
+			return fmt.Errorf("write chunk-committed WAL record: %w", err)
+		}
+
+		if err := c.chunkRepo.UpdateChunkStatus(
 			metadata.ID,
 			models.ChunkStatusStored,
-		)
-
-		if err != nil {
+		); err != nil {
 			return fmt.Errorf("update chunk status: %w", err)
 		}
 
 		chunkCount++
-
 		return nil
 	})
 
 	if err != nil {
-		_ = c.fileRepo.UpdateFileStatus(
-			file.ID,
-			models.FileStatusFailed,
-		)
-
-		return models.File{}, fmt.Errorf("process file chunks: %w", err)
+		return failUpload(fmt.Errorf("process file chunks: %w", err))
 	}
-
-	// Validate the received file size.
-	// The HTTP layer should also enforce a maximum upload size.
-	// This protects against unexpected reader behavior.
-	checksum := hex.EncodeToString(hasher.Sum(nil))
 
 	if err := c.fileRepo.UpdateUploadDetails(
 		file.ID,
 		checksum,
 		chunkCount,
 	); err != nil {
-		_ = c.fileRepo.UpdateFileStatus(
-			file.ID,
-			models.FileStatusFailed,
-		)
-
-		return models.File{}, fmt.Errorf("update file metadata: %w", err)
+		return failUpload(fmt.Errorf("update file metadata: %w", err))
 	}
 
-	// Mark the file available only after all chunks are stored.
+	// This event means every chunk has been committed and the full
+	// file checksum has been calculated.
+	if err := c.walWriter.Append(models.Record{
+		Event:      models.EventUploadCompleted,
+		FileID:     file.ID,
+		ChunkCount: chunkCount,
+		Checksum:   checksum,
+	}); err != nil {
+		return failUpload(fmt.Errorf("write upload-completed WAL record: %w", err))
+	}
+
 	if err := c.fileRepo.UpdateFileStatus(
 		file.ID,
 		models.FileStatusAvailable,
@@ -152,6 +276,12 @@ func (c *FileController) UploadFile(
 	file.ChunkCount = chunkCount
 	file.Status = models.FileStatusAvailable
 
+	// Completed uploads no longer need their source staging file.
+	if err := os.Remove(stagingPath); err != nil {
+		// Do not fail an otherwise successful upload because cleanup failed.
+		fmt.Printf("warning: could not remove staging file %s: %v\n", stagingPath, err)
+	}
+
 	return file, nil
 }
 
@@ -159,10 +289,8 @@ func (c *FileController) UploadHandler(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	// Restrict the maximum request size.
 	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize)
 
-	// Parse multipart form.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "Invalid or oversized upload", http.StatusBadRequest)
 		return
@@ -172,22 +300,19 @@ func (c *FileController) UploadHandler(
 		defer r.MultipartForm.RemoveAll()
 	}
 
-	// Retrieve the uploaded file.
-	file, header, err := r.FormFile("file")
+	uploaded, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "File is required", http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
+	defer uploaded.Close()
 
-	// Retrieve authenticated user ID from middleware.
 	userID, ok := r.Context().Value(middleware.UserIDKey).(string)
 	if !ok || userID == "" {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Use an optional display name.
 	fileName := r.FormValue("name")
 	if fileName == "" {
 		fileName = filepath.Base(header.Filename)
@@ -200,29 +325,21 @@ func (c *FileController) UploadHandler(
 
 	contentType := header.Header.Get("Content-Type")
 
-	// Execute the upload pipeline.
 	uploadedFile, err := c.UploadFile(
 		r.Context(),
 		userID,
 		fileName,
 		contentType,
 		header.Size,
-		file,
+		uploaded,
 	)
-
 	if err != nil {
-		http.Error(
-			w,
-			"File upload failed",
-			http.StatusInternalServerError,
-		)
+		http.Error(w, "File upload failed", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 
-	if err := json.NewEncoder(w).Encode(uploadedFile); err != nil {
-		return
-	}
+	_ = json.NewEncoder(w).Encode(uploadedFile)
 }
