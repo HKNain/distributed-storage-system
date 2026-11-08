@@ -33,7 +33,7 @@ type Record struct {
 
 	// Chunk information
 	ChunkID    string `json:"chunk_id,omitempty"`
-	ChunkIndex int    `json:"chunk_index,omitempty"`
+	ChunkIndex int    `json:"chunk_index"`
 	ChunkSize  int64  `json:"chunk_size,omitempty"`
 	Checksum   string `json:"checksum,omitempty"`
 

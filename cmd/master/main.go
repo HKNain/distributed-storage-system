@@ -103,6 +103,19 @@ func main() {
 
 	go nodeRegistry.RunMonitor(monitorCtx)
 
+	// recover interrupted uploads before accepting new uploads.
+	recoveryCtx, cancelRecovery := context.WithTimeout(
+		context.Background(),
+		30*time.Minute,
+	)
+
+	if err := fileController.RecoverInterruptedUploads(recoveryCtx); err != nil {
+		cancelRecovery()
+		log.Fatalf("Upload recovery failed: %v", err)
+	}
+
+	cancelRecovery()
+
 	// Master gRPC control server
 	masterGRPC, masterListener, err := rpc.StartMasterGRPCServer(
 		":4000",
