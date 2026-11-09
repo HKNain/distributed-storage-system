@@ -1,3 +1,4 @@
+
 package repository
 
 import (
@@ -27,6 +28,7 @@ func NewChunkRepository(db *bolt.DB) *ChunkRepository {
 }
 
 // CreateChunk stores chunk metadata.
+// If an ID is provided, it is preserved. Otherwise, a new UUID is generated.
 func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, error) {
 	if chunk.FileID == "" {
 		return chunk, errors.New("file ID is required")
@@ -43,6 +45,7 @@ func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, erro
 	if !isValidChunkStatus(chunk.Status) {
 		return chunk, errors.New("invalid chunk status")
 	}
+
 	err := repo.DB.Update(func(tx *bolt.Tx) error {
 		filesBucket := tx.Bucket(database.FilesBucket)
 		chunksBucket := tx.Bucket(database.ChunksBucket)
@@ -51,7 +54,7 @@ func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, erro
 			return errors.New("required database bucket not found")
 		}
 
-		// Verify that the parent file exists.
+		// Verify parent file exists.
 		fileData := filesBucket.Get([]byte(chunk.FileID))
 		if fileData == nil {
 			return ErrFileNotFound
@@ -62,12 +65,11 @@ func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, erro
 			return err
 		}
 
-		// Only accept chunks for files being uploaded.
 		if file.Status != models.FileStatusUploading {
 			return errors.New("file is not accepting chunks")
 		}
 
-		// Check that this index is not already used by the file.
+		// Ensure this file/index combination is unique.
 		err := chunksBucket.ForEach(func(_, value []byte) error {
 			var existing models.Chunk
 
@@ -86,16 +88,24 @@ func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, erro
 			return err
 		}
 
-		// Generate a unique chunk ID.
-		for {
-			chunk.ID = uuid.NewString()
+		// Preserve a caller-provided ID (needed for WAL recovery).
+		if chunk.ID != "" {
+			if chunksBucket.Get([]byte(chunk.ID)) != nil {
+				return errors.New("chunk ID already exists")
+			}
+		} else {
+			for {
+				chunk.ID = uuid.NewString()
 
-			if chunksBucket.Get([]byte(chunk.ID)) == nil {
-				break
+				if chunksBucket.Get([]byte(chunk.ID)) == nil {
+					break
+				}
 			}
 		}
 
-		chunk.CreatedAt = time.Now().UTC()
+		if chunk.CreatedAt.IsZero() {
+			chunk.CreatedAt = time.Now().UTC()
+		}
 
 		data, err := json.Marshal(chunk)
 		if err != nil {
@@ -108,7 +118,7 @@ func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, erro
 	return chunk, err
 }
 
-// GetChunkByID retrieves a chunk using its ID.
+// GetChunkByID retrieves metadata using the chunk ID.
 func (repo *ChunkRepository) GetChunkByID(chunkID string) (models.Chunk, error) {
 	var chunk models.Chunk
 
@@ -127,6 +137,52 @@ func (repo *ChunkRepository) GetChunkByID(chunkID string) (models.Chunk, error) 
 	})
 
 	return chunk, err
+}
+
+// GetChunkByFileIDAndIndex retrieves metadata using a file ID and chunk index.
+// This is especially important during recovery when WAL records are missing.
+func (repo *ChunkRepository) GetChunkByFileIDAndIndex(
+	fileID string,
+	index int,
+) (models.Chunk, error) {
+	var result models.Chunk
+	found := false
+
+	err := repo.DB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(database.ChunksBucket)
+		if bucket == nil {
+			return errors.New("chunks bucket not found")
+		}
+
+		return bucket.ForEach(func(_, value []byte) error {
+			var chunk models.Chunk
+
+			if err := json.Unmarshal(value, &chunk); err != nil {
+				return err
+			}
+
+			if chunk.FileID == fileID && chunk.Index == index {
+				if found {
+					return errors.New("multiple chunks found for the same file and index")
+				}
+
+				result = chunk
+				found = true
+			}
+
+			return nil
+		})
+	})
+
+	if err != nil {
+		return models.Chunk{}, err
+	}
+
+	if !found {
+		return models.Chunk{}, ErrChunkNotFound
+	}
+
+	return result, nil
 }
 
 // GetChunksByFileID retrieves all chunks belonging to a file.
@@ -158,7 +214,6 @@ func (repo *ChunkRepository) GetChunksByFileID(fileID string) ([]models.Chunk, e
 		return nil, err
 	}
 
-	// UUID keys do not preserve chunk order.
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].Index < chunks[j].Index
 	})
@@ -166,7 +221,7 @@ func (repo *ChunkRepository) GetChunksByFileID(fileID string) ([]models.Chunk, e
 	return chunks, nil
 }
 
-// UpdateChunkStatus updates the status of a chunk.
+// UpdateChunkStatus updates a chunk's status.
 func (repo *ChunkRepository) UpdateChunkStatus(
 	chunkID string,
 	status models.ChunkStatus,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,13 +13,15 @@ import (
 
 	"github.com/HKNain/distributed-storage-system/internal/chunker"
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/repository"
 	"github.com/HKNain/distributed-storage-system/internal/wal"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// RecoverInterruptedUploads replays incomplete uploads from their staging files.
-// It must run after the storage node is available and before accepting new uploads.
+// RecoverInterruptedUploads must run after storage nodes are available
+// and before accepting new uploads.
 func (c *FileController) RecoverInterruptedUploads(ctx context.Context) error {
 	if c.walWriter == nil || c.storageClient == nil || c.storageNodeID == "" {
 		return fmt.Errorf("recovery dependencies are not configured")
@@ -38,6 +41,7 @@ func (c *FileController) RecoverInterruptedUploads(ctx context.Context) error {
 	for fileID := range plans {
 		fileIDs = append(fileIDs, fileID)
 	}
+
 	sort.Strings(fileIDs)
 
 	for _, fileID := range fileIDs {
@@ -102,7 +106,7 @@ func (c *FileController) recoverUpload(
 		var metadata models.Chunk
 
 		if recorded {
-			// A WAL record must match the staged file exactly.
+			// A WAL record must match the staged file.
 			if existing.ChunkID == "" ||
 				existing.Size != chunk.Metadata.Size ||
 				existing.Checksum != chunk.Metadata.Hash {
@@ -122,51 +126,87 @@ func (c *FileController) recoverUpload(
 			}
 
 			metadata, err = c.chunkRepo.GetChunkByID(existing.ChunkID)
-			if err != nil {
-				return fmt.Errorf("load metadata for chunk %d: %w", index, err)
+
+			if errors.Is(err, repository.ErrChunkNotFound) {
+				// WAL intent exists, but metadata was not persisted.
+				// Recreate metadata using the original WAL chunk ID.
+				metadata = chunk.Metadata
+				metadata.ID = existing.ChunkID
+
+				metadata, err = c.chunkRepo.CreateChunk(metadata)
 			}
 
-			if metadata.FileID != plan.FileID ||
-				metadata.Index != index ||
-				metadata.Hash != chunk.Metadata.Hash ||
-				metadata.Size != chunk.Metadata.Size {
-				return fmt.Errorf("chunk metadata mismatch at index %d", index)
+			if err != nil {
+				return fmt.Errorf(
+					"load or recreate metadata for chunk %d: %w",
+					index,
+					err,
+				)
 			}
 		} else {
-			// The crash happened before this chunk was recorded in the WAL.
-			metadata, err = c.chunkRepo.CreateChunk(chunk.Metadata)
-			if err != nil {
-				return fmt.Errorf("create metadata for chunk %d: %w", index, err)
+			// No WAL record: metadata may still exist in bbolt.
+			metadata, err = c.chunkRepo.GetChunkByFileIDAndIndex(
+				plan.FileID,
+				index,
+			)
+
+			if err != nil && !errors.Is(err, repository.ErrChunkNotFound) {
+				return fmt.Errorf(
+					"find metadata for chunk %d: %w",
+					index,
+					err,
+				)
 			}
 
-			startRecord := models.Record{
-				Event:      models.EventChunkWriteStarted,
-				FileID:     plan.FileID,
-				ChunkID:    metadata.ID,
-				ChunkIndex: metadata.Index,
-				ChunkSize:  metadata.Size,
-				Checksum:   metadata.Hash,
-				NodeID:     c.storageNodeID,
+			if errors.Is(err, repository.ErrChunkNotFound) {
+				// Neither WAL nor metadata exists.
+				// Generate the ID first, then persist WAL intent BEFORE metadata.
+				metadata = chunk.Metadata
+				metadata.ID = uuid.NewString()
+
+				if err := c.appendRecoveryChunkStart(plan, metadata); err != nil {
+					return err
+				}
+
+				metadata, err = c.chunkRepo.CreateChunk(metadata)
+				if err != nil {
+					return fmt.Errorf(
+						"create metadata for chunk %d: %w",
+						index,
+						err,
+					)
+				}
+			} else {
+				// Metadata exists even though its WAL records are missing.
+				if metadata.FileID != plan.FileID ||
+					metadata.Index != index ||
+					metadata.Hash != chunk.Metadata.Hash ||
+					metadata.Size != chunk.Metadata.Size {
+					return fmt.Errorf(
+						"existing metadata does not match staged chunk %d",
+						index,
+					)
+				}
+
+				// Reuse its existing ID and restore the missing WAL intent.
+				if err := c.appendRecoveryChunkStart(plan, metadata); err != nil {
+					return err
+				}
 			}
 
-			if err := c.walWriter.Append(startRecord); err != nil {
-				return fmt.Errorf("record start for chunk %d: %w", index, err)
-			}
-
-			// Include the new chunk in the in-memory recovery plan.
-			existing = &wal.ChunkRecovery{
-				ChunkID:  metadata.ID,
-				Index:    metadata.Index,
-				NodeID:   c.storageNodeID,
-				Checksum: metadata.Hash,
-				Size:     metadata.Size,
-				State:    wal.ChunkUncertain,
-			}
-			plan.Chunks[index] = existing
-			recorded = true
+			existing = plan.Chunks[index]
 		}
 
-		// Always check the actual bytes on the storage node.
+		// Validate metadata regardless of how it was recovered.
+		if metadata.ID == "" ||
+			metadata.FileID != plan.FileID ||
+			metadata.Index != index ||
+			metadata.Hash != chunk.Metadata.Hash ||
+			metadata.Size != chunk.Metadata.Size {
+			return fmt.Errorf("chunk metadata mismatch at index %d", index)
+		}
+
+		// Check actual physical data on the storage node.
 		storedData, getErr := c.storageClient.GetChunk(ctx, metadata.ID)
 
 		if getErr == nil {
@@ -181,10 +221,13 @@ func (c *FileController) recoverUpload(
 				)
 			}
 		} else {
-			// Only retry when the node explicitly reports that the
-			// chunk does not exist. Network errors are not proof of absence.
+			// Only restore if the node explicitly reports NotFound.
 			if status.Code(getErr) != codes.NotFound {
-				return fmt.Errorf("check chunk %d on storage node: %w", index, getErr)
+				return fmt.Errorf(
+					"check chunk %d on storage node: %w",
+					index,
+					getErr,
+				)
 			}
 
 			if err := c.storageClient.StoreChunk(
@@ -197,9 +240,9 @@ func (c *FileController) recoverUpload(
 			}
 		}
 
-		// If there was no commit record, write one now.
+		// Record commit if it was absent from the WAL.
 		if existing.Commit == nil {
-			if err := c.walWriter.Append(models.Record{
+			commitRecord := models.Record{
 				Event:      models.EventChunkWriteCommitted,
 				FileID:     plan.FileID,
 				ChunkID:    metadata.ID,
@@ -207,16 +250,29 @@ func (c *FileController) recoverUpload(
 				ChunkSize:  metadata.Size,
 				Checksum:   metadata.Hash,
 				NodeID:     c.storageNodeID,
-			}); err != nil {
-				return fmt.Errorf("record commit for chunk %d: %w", index, err)
 			}
+
+			if err := c.walWriter.Append(commitRecord); err != nil {
+				return fmt.Errorf(
+					"record commit for chunk %d: %w",
+					index,
+					err,
+				)
+			}
+
+			existing.Commit = &commitRecord
+			existing.State = wal.ChunkCommitted
 		}
 
 		if err := c.chunkRepo.UpdateChunkStatus(
 			metadata.ID,
 			models.ChunkStatusStored,
 		); err != nil {
-			return fmt.Errorf("update status for chunk %d: %w", index, err)
+			return fmt.Errorf(
+				"update status for chunk %d: %w",
+				index,
+				err,
+			)
 		}
 
 		chunkCount++
@@ -228,6 +284,22 @@ func (c *FileController) recoverUpload(
 	}
 
 	fileChecksum := hex.EncodeToString(hasher.Sum(nil))
+
+	// If the original full-file checksum was recorded in UPLOAD_STARTED,
+	// verify it before declaring the upload complete.
+	if plan.Started.Checksum != "" &&
+		plan.Started.Checksum != fileChecksum {
+		return fmt.Errorf(
+			"full-file checksum mismatch: expected %s, got %s",
+			plan.Started.Checksum,
+			fileChecksum,
+		)
+	}
+
+	// Release the staging file handle before attempting deletion.
+	if err := stagedFile.Close(); err != nil {
+		return fmt.Errorf("close staging file: %w", err)
+	}
 
 	if err := c.fileRepo.UpdateUploadDetails(
 		plan.FileID,
@@ -268,6 +340,43 @@ func (c *FileController) recoverUpload(
 		chunkCount,
 		fileChecksum,
 	)
+
+	return nil
+}
+
+// appendRecoveryChunkStart writes a durable WAL intent and adds it
+// to the in-memory recovery plan.
+func (c *FileController) appendRecoveryChunkStart(
+	plan *wal.UploadRecoveryPlan,
+	metadata models.Chunk,
+) error {
+	record := models.Record{
+		Event:      models.EventChunkWriteStarted,
+		FileID:     plan.FileID,
+		ChunkID:    metadata.ID,
+		ChunkIndex: metadata.Index,
+		ChunkSize:  metadata.Size,
+		Checksum:   metadata.Hash,
+		NodeID:     c.storageNodeID,
+	}
+
+	if err := c.walWriter.Append(record); err != nil {
+		return fmt.Errorf(
+			"record start for chunk %d: %w",
+			metadata.Index,
+			err,
+		)
+	}
+
+	plan.Chunks[metadata.Index] = &wal.ChunkRecovery{
+		ChunkID:  metadata.ID,
+		Index:    metadata.Index,
+		NodeID:   c.storageNodeID,
+		Checksum: metadata.Hash,
+		Size:     metadata.Size,
+		State:    wal.ChunkUncertain,
+		Started:  &record,
+	}
 
 	return nil
 }
