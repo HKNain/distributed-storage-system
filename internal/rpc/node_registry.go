@@ -1,3 +1,4 @@
+
 package rpc
 
 import (
@@ -12,15 +13,9 @@ import (
 type NodeState string
 
 const (
-	NodeActive  NodeState = "ACTIVE"
-	NodeMissed  NodeState = "MISSED"
-	NodeDead    NodeState = "DEAD"
-)
-
-const (
-	HeartbeatInterval = 10 * time.Second
-	FailureThreshold  = 3
-	MonitorInterval   = 60 * time.Second
+	NodeActive NodeState = "ACTIVE"
+	NodeMissed NodeState = "MISSED"
+	NodeDead   NodeState = "DEAD"
 )
 
 type StorageNodeInfo struct {
@@ -42,7 +37,6 @@ func NewNodeRegistry() *NodeRegistry {
 	}
 }
 
-// RecordHeartbeat registers a node or refreshes its heartbeat.
 func (r *NodeRegistry) RecordHeartbeat(nodeID, address string) bool {
 	nodeID = strings.TrimSpace(nodeID)
 	address = strings.TrimSpace(address)
@@ -57,9 +51,7 @@ func (r *NodeRegistry) RecordHeartbeat(nodeID, address string) bool {
 	node, exists := r.nodes[nodeID]
 
 	if !exists {
-		node = &StorageNodeInfo{
-			NodeID: nodeID,
-		}
+		node = &StorageNodeInfo{NodeID: nodeID}
 		r.nodes[nodeID] = node
 	}
 
@@ -71,19 +63,28 @@ func (r *NodeRegistry) RecordHeartbeat(nodeID, address string) bool {
 	return true
 }
 
-// Snapshot returns the current health of all registered nodes.
+// Snapshot returns independent copies of registered node information.
 func (r *NodeRegistry) Snapshot() []StorageNodeInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	now := time.Now()
+	interval := HeartbeatIntervalFromEnv()
+	failureThreshold := FailureThresholdFromEnv()
+
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	if failureThreshold <= 0 {
+		failureThreshold = 3
+	}
+
 	result := make([]StorageNodeInfo, 0, len(r.nodes))
 
 	for _, node := range r.nodes {
 		info := *node
 
-		missed := int(now.Sub(info.LastHeartbeat) / HeartbeatInterval)
-
+		missed := int(now.Sub(info.LastHeartbeat) / interval)
 		if missed < 0 {
 			missed = 0
 		}
@@ -91,7 +92,7 @@ func (r *NodeRegistry) Snapshot() []StorageNodeInfo {
 		info.MissedBeats = missed
 
 		switch {
-		case missed >= FailureThreshold:
+		case missed >= failureThreshold:
 			info.State = NodeDead
 		case missed > 0:
 			info.State = NodeMissed
@@ -109,9 +110,46 @@ func (r *NodeRegistry) Snapshot() []StorageNodeInfo {
 	return result
 }
 
-// RunMonitor periodically prints the health of registered nodes.
+// WaitForActiveNodes waits until at least minCount nodes are ACTIVE.
+func (r *NodeRegistry) WaitForActiveNodes(
+	ctx context.Context,
+	minCount int,
+) error {
+	if minCount < 1 {
+		minCount = 1
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		activeCount := 0
+
+		for _, node := range r.Snapshot() {
+			if node.State == NodeActive {
+				activeCount++
+			}
+		}
+
+		if activeCount >= minCount {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (r *NodeRegistry) RunMonitor(ctx context.Context) {
-	ticker := time.NewTicker(MonitorInterval)
+	interval := MonitorIntervalFromEnv()
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -120,9 +158,7 @@ func (r *NodeRegistry) RunMonitor(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			nodes := r.Snapshot()
-
-			for _, node := range nodes {
+			for _, node := range r.Snapshot() {
 				switch node.State {
 				case NodeActive:
 					log.Printf("Storage Node %s: ACTIVE", node.NodeID)
@@ -132,7 +168,7 @@ func (r *NodeRegistry) RunMonitor(ctx context.Context) {
 						"Storage Node %s: MISSED (%d/%d)",
 						node.NodeID,
 						node.MissedBeats,
-						FailureThreshold,
+						FailureThresholdFromEnv(),
 					)
 
 				case NodeDead:

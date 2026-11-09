@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -9,6 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/joho/godotenv"
+
 	storagepb "github.com/HKNain/distributed-storage-system/api/proto"
 	"github.com/HKNain/distributed-storage-system/internal/rpc"
 	"github.com/HKNain/distributed-storage-system/internal/storage"
@@ -17,14 +18,15 @@ import (
 )
 
 func main() {
+	// Load shared configuration.
+	// Existing process environment variables take precedence over .env.
+	if err := godotenv.Load(); err != nil {
+		log.Printf("Could not load .env: %v", err)
+	}
+
 	port := os.Getenv("STORAGE_NODE_PORT")
 	if port == "" {
 		port = "3001"
-	}
-
-	storageDir := os.Getenv("STORAGE_DIR")
-	if storageDir == "" {
-		storageDir = "data/chunks"
 	}
 
 	nodeID := os.Getenv("STORAGE_NODE_ID")
@@ -32,9 +34,24 @@ func main() {
 		log.Fatal("STORAGE_NODE_ID environment variable is required")
 	}
 
+	host := os.Getenv("STORAGE_NODE_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+
 	nodeAddress := os.Getenv("STORAGE_NODE_ADDRESS")
 	if nodeAddress == "" {
-		nodeAddress = "localhost:" + port
+		nodeAddress = host + ":" + port
+	}
+
+	storageDir := os.Getenv("STORAGE_DIR")
+	if storageDir == "" {
+		storageDir = "data/chunks"
+	}
+
+	masterAddress := os.Getenv("MASTER_GRPC_ADDRESS")
+	if masterAddress == "" {
+		masterAddress = "localhost:4000"
 	}
 
 	// Initialize disk storage.
@@ -63,7 +80,6 @@ func main() {
 		storageServer,
 	)
 
-	// Context for graceful shutdown.
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -71,32 +87,34 @@ func main() {
 	)
 	defer stop()
 
-	// Start heartbeat client.
-	go func() {
-		if err := rpc.RunHeartbeatClient(
-			ctx,
-			"localhost:4000",
-			nodeID,
-			nodeAddress,
-		); err != nil {
-			log.Printf("Heartbeat client error: %v", err)
-		}
-	}()
-
-	log.Printf("Storage Node %s listening on port %s", nodeID, port)
-	log.Printf("Storage directory: %s", storageDir)
-	log.Printf("Master address: localhost:4000")
-
-	// Serve blocks, so run it in a goroutine.
+	// Start the gRPC server before sending heartbeats.
 	serverErr := make(chan error, 1)
 
 	go func() {
 		serverErr <- grpcServer.Serve(listener)
 	}()
 
+	log.Printf("Storage Node %s started", nodeID)
+	log.Printf("Listening address: %s", nodeAddress)
+	log.Printf("Storage directory: %s", storageDir)
+	log.Printf("Master address: %s", masterAddress)
+	log.Printf("Heartbeat interval: %s", rpc.HeartbeatIntervalFromEnv())
+
+	// Start heartbeat client.
+	go func() {
+		if err := rpc.RunHeartbeatClient(
+			ctx,
+			masterAddress,
+			nodeID,
+			nodeAddress,
+		); err != nil {
+			log.Printf("Heartbeat client error for %s: %v", nodeID, err)
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
-		log.Println("Shutting down storage node...")
+		log.Printf("Shutting down storage node %s...", nodeID)
 		grpcServer.GracefulStop()
 
 	case err := <-serverErr:

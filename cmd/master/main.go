@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -24,63 +25,107 @@ import (
 )
 
 func main() {
+	// Load environment variables.
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file:", err)
 	}
 
+	// Initialize logger.
 	if err := logger.Init(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Database
+	// Database.
 	db, err := database.OpenDB("data/storage.db")
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
 	}
 	defer db.Close()
 
-	// Repositories
+	// Repositories.
 	userRepo := repository.NewUserRepository(db)
 	fileRepo := repository.NewFileRepository(db)
 	chunkRepo := repository.NewChunkRepository(db)
 
-	// Storage node client
-	storageClient, err := rpc.NewStorageClient("localhost:3001")
-	if err != nil {
-		log.Fatal("Failed to initialize storage client:", err)
-	}
-	defer storageClient.Close()
+	// Storage node registry.
+	nodeRegistry := rpc.NewNodeRegistry()
 
-	// WAL writer: one shared instance for the master process.
+	// Start master gRPC server before waiting for storage nodes.
+	masterGRPC, masterListener, err := rpc.StartMasterGRPCServer(
+		":4000",
+		nodeRegistry,
+	)
+	if err != nil {
+		log.Fatal("Failed to start master gRPC server:", err)
+	}
+
+	go func() {
+		if err := masterGRPC.Serve(masterListener); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("Master gRPC server stopped: %v", err)
+			}
+		}
+	}()
+
+	// Start node monitor.
+	monitorCtx, cancelMonitor := context.WithCancel(
+		context.Background(),
+	)
+	defer cancelMonitor()
+
+	go nodeRegistry.RunMonitor(monitorCtx)
+
+	// Configure expected storage node count.
+	nodeCount := 4
+
+	if value := os.Getenv("STORAGE_NODE_COUNT"); value != "" {
+		if _, err := fmt.Sscanf(value, "%d", &nodeCount); err != nil || nodeCount < 1 {
+			log.Fatal("Invalid STORAGE_NODE_COUNT")
+		}
+	}
+
+	// Wait for storage nodes to register and become active.
+	waitCtx, cancelWait := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+
+	if err := nodeRegistry.WaitForActiveNodes(waitCtx, nodeCount); err != nil {
+		cancelWait()
+		log.Fatalf("Storage nodes did not become ready: %v", err)
+	}
+
+	cancelWait()
+
+	log.Printf("%d storage nodes are active", nodeCount)
+
+	// Initialize shared storage client manager.
+	storageManager := rpc.NewStorageClientManager(nodeRegistry)
+	defer storageManager.Close()
+
+	// Initialize shared WAL writer.
 	walWriter, err := wal.OpenWriter("data/wal/uploads.wal")
 	if err != nil {
 		log.Fatal("Failed to initialize WAL:", err)
 	}
+
 	defer func() {
 		if err := walWriter.Close(); err != nil {
 			log.Printf("Failed to close WAL: %v", err)
 		}
 	}()
 
-	// Controllers
+	// Controllers.
 	authController := controller.NewAuthController(userRepo)
-
-	// WAL writer is injected into FileController.
-	// temporary node assign ofr :3001 till further implementation of node registry and selection is done
-	storageNodeID := os.Getenv("STORAGE_NODE_ID")
-	if storageNodeID == "" {
-		log.Fatal("STORAGE_NODE_ID is not configured in master")
-	}
 
 	fileController := controller.NewFileController(
 		fileRepo,
 		chunkRepo,
-		storageClient,
+		storageManager,
 		walWriter,
-		storageNodeID,
 	)
 
-	// Middleware
+	// JWT authentication middleware.
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		log.Fatal("JWT_SECRET is not configured")
@@ -88,22 +133,18 @@ func main() {
 
 	authMiddleware := middleware.AuthMiddleware(jwtSecret)
 
-	// Routes
+	// Routes.
 	mux := http.NewServeMux()
+
 	routes.AuthRoutes(mux, authController)
 	routes.FileRoutes(mux, fileController, authMiddleware)
 
+	// Middleware.
 	handler := middleware.LoggingMiddleware(mux)
 
-	// Storage node registry and monitor
-	nodeRegistry := rpc.NewNodeRegistry()
+	// Recover interrupted uploads before accepting new uploads.
+	log.Println("Starting interrupted upload recovery...")
 
-	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
-	defer cancelMonitor()
-
-	go nodeRegistry.RunMonitor(monitorCtx)
-
-	// recover interrupted uploads before accepting new uploads.
 	recoveryCtx, cancelRecovery := context.WithTimeout(
 		context.Background(),
 		30*time.Minute,
@@ -116,30 +157,18 @@ func main() {
 
 	cancelRecovery()
 
-	// Master gRPC control server
-	masterGRPC, masterListener, err := rpc.StartMasterGRPCServer(
-		":4000",
-		nodeRegistry,
-	)
-	if err != nil {
-		log.Fatal("Failed to start master gRPC server:", err)
-	}
-	defer masterGRPC.Stop()
+	log.Println("Upload recovery completed successfully")
 
-	go func() {
-		if err := masterGRPC.Serve(masterListener); err != nil {
-			log.Printf("Master gRPC server stopped: %v", err)
-		}
-	}()
-
-	// HTTP server
+	// HTTP server.
 	httpServer := &http.Server{
-		Addr:    ":3000",
-		Handler: handler,
+		Addr:              ":3000",
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
 		log.Println("Master HTTP server listening on :3000")
+
 		if err := httpServer.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP server error: %v", err)
@@ -147,8 +176,9 @@ func main() {
 	}()
 
 	log.Println("Master gRPC control server listening on :4000")
+	log.Println("Master server is ready")
 
-	// Graceful shutdown
+	// Graceful shutdown.
 	signalCtx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -157,8 +187,10 @@ func main() {
 	defer stop()
 
 	<-signalCtx.Done()
+
 	log.Println("Shutdown signal received")
 
+	// Stop accepting new requests.
 	shutdownCtx, cancelShutdown := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
@@ -169,6 +201,11 @@ func main() {
 		log.Printf("HTTP graceful shutdown failed: %v", err)
 	}
 
+	// Stop node monitoring.
+	cancelMonitor()
+
+	// Stop gRPC server.
 	masterGRPC.GracefulStop()
+
 	log.Println("Master server stopped")
 }

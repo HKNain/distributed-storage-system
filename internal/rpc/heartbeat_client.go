@@ -6,6 +6,7 @@ import (
 	"time"
 
 	storagepb "github.com/HKNain/distributed-storage-system/api/proto"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -16,7 +17,6 @@ func RunHeartbeatClient(
 	nodeID string,
 	nodeAddress string,
 ) error {
-
 	conn, err := grpc.NewClient(
 		masterAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -28,32 +28,45 @@ func RunHeartbeatClient(
 
 	client := storagepb.NewMasterControlServiceClient(conn)
 
+	interval := HeartbeatIntervalFromEnv()
+
 	sendHeartbeat := func() {
 		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 
-		response, err := client.Heartbeat(callCtx, &storagepb.HeartbeatRequest{
-			NodeId:  nodeID,
-			Address: nodeAddress,
-		})
+		response, err := client.Heartbeat(
+			callCtx,
+			&storagepb.HeartbeatRequest{
+				NodeId:  nodeID,
+				Address: nodeAddress,
+			},
+		)
 
 		if err != nil {
-			log.Printf("Heartbeat failed for node %s: %v", nodeID, err)
+			log.Printf(
+				"Heartbeat failed for node %s: %v",
+				nodeID,
+				err,
+			)
 			return
 		}
 
 		if !response.GetAccepted() {
-			log.Printf("Heartbeat rejected for node %s: %s", nodeID, response.GetMessage())
+			log.Printf(
+				"Heartbeat rejected for node %s: %s",
+				nodeID,
+				response.GetMessage(),
+			)
 			return
 		}
 
 		log.Printf("Heartbeat sent: Storage Node %s", nodeID)
 	}
 
-	// Send the first heartbeat immediately.
+	// Register immediately instead of waiting for the first ticker event.
 	sendHeartbeat()
 
-	ticker := time.NewTicker(HeartbeatInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {

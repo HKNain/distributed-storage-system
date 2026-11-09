@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,10 +12,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"bytes"
 
-	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/HKNain/distributed-storage-system/internal/middleware"
+	"github.com/HKNain/distributed-storage-system/internal/models"
 )
 
 var (
@@ -28,10 +28,9 @@ func (c *FileController) DownloadFile(
 	userID string,
 	fileID string,
 ) (*models.File, *os.File, error) {
-
-	// Ensure storage client is initialized.
-	if c.storageClient == nil {
-		return nil, nil, errors.New("storage client is not initialized")
+	// Ensure the storage manager is initialized.
+	if c.storageManager == nil {
+		return nil, nil, errors.New("storage client manager is not initialized")
 	}
 
 	// 1. Fetch file metadata.
@@ -73,16 +72,19 @@ func (c *FileController) DownloadFile(
 	}
 
 	cleanup := func(err error) (*models.File, *os.File, error) {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
 		return nil, nil, err
 	}
 
 	fileHasher := sha256.New()
 	var totalSize int64
 
-	// 6. Retrieve and verify every chunk.
+	// 6. Retrieve and verify every chunk from its assigned node.
 	for i, chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			return cleanup(err)
+		}
 
 		if chunk.Index != i {
 			return cleanup(fmt.Errorf(
@@ -100,11 +102,38 @@ func (c *FileController) DownloadFile(
 			))
 		}
 
-		data, err := c.storageClient.GetChunk(ctx, chunk.ID)
+		// New chunks have StorageNodeID in their metadata.
+		// Older chunks may need the legacy node fallback.
+		nodeID := chunk.StorageNodeID
+		if nodeID == "" {
+			nodeID = legacyStorageNodeID()
+		}
+
+		if nodeID == "" {
+			return cleanup(fmt.Errorf(
+				"storage node ID is missing for chunk %s; configure LEGACY_STORAGE_NODE_ID for legacy chunks",
+				chunk.ID,
+			))
+		}
+
+		// Retrieve the client for this exact node.
+		// Do not read from another node if this one is unavailable.
+		storageClient, err := c.storageManager.GetClientForNode(nodeID)
 		if err != nil {
 			return cleanup(fmt.Errorf(
-				"retrieve chunk %s: %w",
+				"get storage client for chunk %s on node %q: %w",
 				chunk.ID,
+				nodeID,
+				err,
+			))
+		}
+
+		data, err := storageClient.GetChunk(ctx, chunk.ID)
+		if err != nil {
+			return cleanup(fmt.Errorf(
+				"retrieve chunk %s from node %q: %w",
+				chunk.ID,
+				nodeID,
 				err,
 			))
 		}
@@ -171,8 +200,10 @@ func (c *FileController) DownloadFile(
 }
 
 // DownloadHandler handles HTTP file downloads.
-func (c *FileController) DownloadHandler(w http.ResponseWriter, r *http.Request) {
-
+func (c *FileController) DownloadHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	userID, ok := r.Context().Value(middleware.UserIDKey).(string)
 	if !ok || userID == "" {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -185,7 +216,11 @@ func (c *FileController) DownloadHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	file, tempFile, err := c.DownloadFile(r.Context(), userID, fileID)
+	file, tempFile, err := c.DownloadFile(
+		r.Context(),
+		userID,
+		fileID,
+	)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrDownloadNotFound):
@@ -195,7 +230,11 @@ func (c *FileController) DownloadHandler(w http.ResponseWriter, r *http.Request)
 			http.Error(w, "File is not available", http.StatusConflict)
 
 		case errors.Is(err, ErrFileIntegrity):
-			http.Error(w, "File integrity verification failed", http.StatusInternalServerError)
+			http.Error(
+				w,
+				"File integrity verification failed",
+				http.StatusInternalServerError,
+			)
 
 		default:
 			http.Error(w, "Could not download file", http.StatusInternalServerError)
@@ -216,7 +255,6 @@ func (c *FileController) DownloadHandler(w http.ResponseWriter, r *http.Request)
 	disposition := mime.FormatMediaType("attachment", map[string]string{
 		"filename": filepath.Base(file.Name),
 	})
-
 	w.Header().Set("Content-Disposition", disposition)
 
 	http.ServeContent(

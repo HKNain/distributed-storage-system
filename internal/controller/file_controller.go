@@ -19,34 +19,32 @@ import (
 	"github.com/HKNain/distributed-storage-system/internal/wal"
 )
 
-type FileController struct {
-	fileRepo       *repository.FileRepository
-	chunkRepo      *repository.ChunkRepository
-	storageClient  *rpc.StorageClient
-	walWriter      *wal.Writer
-	storageNodeID  string
-}
-
 const (
 	MaxUploadSize int64 = 10 * 1024 * 1024 * 1024
 	StagingDir          = "data/wal/staging"
 )
 
+type FileController struct {
+	fileRepo       *repository.FileRepository
+	chunkRepo      *repository.ChunkRepository
+	storageManager *rpc.StorageClientManager
+	walWriter      *wal.Writer
+}
+
 func NewFileController(
 	fileRepo *repository.FileRepository,
 	chunkRepo *repository.ChunkRepository,
-	storageClient *rpc.StorageClient,
+	storageManager *rpc.StorageClientManager,
 	walWriter *wal.Writer,
-	storageNodeID string,
 ) *FileController {
 	return &FileController{
-		fileRepo:      fileRepo,
-		chunkRepo:     chunkRepo,
-		storageClient: storageClient,
-		walWriter:     walWriter,
-		storageNodeID: storageNodeID,
+		fileRepo:       fileRepo,
+		chunkRepo:      chunkRepo,
+		storageManager: storageManager,
+		walWriter:      walWriter,
 	}
 }
+
 
 func (c *FileController) UploadFile(
 	ctx context.Context,
@@ -65,7 +63,7 @@ func (c *FileController) UploadFile(
 		return models.File{}, fmt.Errorf("invalid file size")
 	}
 
-	if c.walWriter == nil || c.storageNodeID == "" {
+	if c.walWriter == nil || c.storageManager  == nil {
 		return models.File{}, fmt.Errorf("WAL writer or storage node ID is not configured")
 	}
 
@@ -131,6 +129,7 @@ func (c *FileController) UploadFile(
 		FileID:      file.ID,
 		StagingPath: stagingPath,
 		FileSize:    fileSize,
+		Checksum:    checksum,
 	}); err != nil {
 		_ = c.fileRepo.UpdateFileStatus(file.ID, models.FileStatusFailed)
 		return models.File{}, fmt.Errorf("write upload-started WAL record: %w", err)
@@ -163,28 +162,40 @@ func (c *FileController) UploadFile(
 
 	chunkCount := 0
 
+	
 	err = chunker.Process(stagedReader, file.ID, func(chunk chunker.ChunkData) error {
-		metadata, err := c.chunkRepo.CreateChunk(chunk.Metadata)
+		// 1. Select an ACTIVE storage node using round-robin.
+		node, storageClient, err := c.storageManager.GetNextActiveNode()
+		if err != nil {
+			return fmt.Errorf("select storage node for chunk %d: %w", chunk.Metadata.Index, err)
+		}
+
+		// 2. Persist the selected node ID in chunk metadata.
+		chunkMetadata := chunk.Metadata
+		chunkMetadata.StorageNodeID = node.NodeID
+
+		metadata, err := c.chunkRepo.CreateChunk(chunkMetadata)
 		if err != nil {
 			return fmt.Errorf("create chunk metadata: %w", err)
 		}
 
-		// WAL intent must be durable before sending bytes to the node.
+		// 3. Record the write intent before sending bytes.
 		startRecord := models.Record{
-			Event:       models.EventChunkWriteStarted,
-			FileID:      file.ID,
-			ChunkID:     metadata.ID,
-			ChunkIndex:  metadata.Index,
-			ChunkSize:   metadata.Size,
-			Checksum:    metadata.Hash,
-			NodeID:      c.storageNodeID,
+			Event:      models.EventChunkWriteStarted,
+			FileID:     file.ID,
+			ChunkID:    metadata.ID,
+			ChunkIndex: metadata.Index,
+			ChunkSize:  metadata.Size,
+			Checksum:   metadata.Hash,
+			NodeID:     node.NodeID,
 		}
 
 		if err := c.walWriter.Append(startRecord); err != nil {
 			return fmt.Errorf("write chunk-started WAL record: %w", err)
 		}
 
-		err = c.storageClient.StoreChunk(
+		// 4. Store the chunk on its assigned node.
+		err = storageClient.StoreChunk(
 			ctx,
 			metadata.ID,
 			chunk.Data,
@@ -198,39 +209,42 @@ func (c *FileController) UploadFile(
 			)
 
 			walErr := c.walWriter.Append(models.Record{
-				Event:       models.EventChunkWriteFailed,
-				FileID:      file.ID,
-				ChunkID:     metadata.ID,
-				ChunkIndex:  metadata.Index,
-				ChunkSize:   metadata.Size,
-				Checksum:    metadata.Hash,
-				NodeID:      c.storageNodeID,
-				Error:       err.Error(),
+				Event:      models.EventChunkWriteFailed,
+				FileID:     file.ID,
+				ChunkID:    metadata.ID,
+				ChunkIndex: metadata.Index,
+				ChunkSize:  metadata.Size,
+				Checksum:   metadata.Hash,
+				NodeID:     node.NodeID,
+				Error:      err.Error(),
 			})
 
 			if walErr != nil {
 				return fmt.Errorf(
 					"store chunk %d: %w (also failed to record WAL failure: %v)",
-					metadata.Index, err, walErr,
+					metadata.Index,
+					err,
+					walErr,
 				)
 			}
 
 			return fmt.Errorf("store chunk %d: %w", metadata.Index, err)
 		}
 
-		// Record physical storage success before updating metadata.
+		// 5. Record physical storage success in WAL.
 		if err := c.walWriter.Append(models.Record{
-			Event:       models.EventChunkWriteCommitted,
-			FileID:      file.ID,
-			ChunkID:     metadata.ID,
-			ChunkIndex:  metadata.Index,
-			ChunkSize:   metadata.Size,
-			Checksum:    metadata.Hash,
-			NodeID:      c.storageNodeID,
+			Event:      models.EventChunkWriteCommitted,
+			FileID:     file.ID,
+			ChunkID:    metadata.ID,
+			ChunkIndex: metadata.Index,
+			ChunkSize:  metadata.Size,
+			Checksum:   metadata.Hash,
+			NodeID:     node.NodeID,
 		}); err != nil {
 			return fmt.Errorf("write chunk-committed WAL record: %w", err)
 		}
 
+		// 6. Update metadata only after the WAL commit.
 		if err := c.chunkRepo.UpdateChunkStatus(
 			metadata.ID,
 			models.ChunkStatusStored,
@@ -241,6 +255,7 @@ func (c *FileController) UploadFile(
 		chunkCount++
 		return nil
 	})
+
 
 	if err != nil {
 		return failUpload(fmt.Errorf("process file chunks: %w", err))
@@ -259,7 +274,7 @@ func (c *FileController) UploadFile(
 	if err := c.walWriter.Append(models.Record{
 		Event:      models.EventUploadCompleted,
 		FileID:     file.ID,
-		ChunkCount: chunkCount,
+		ChunkCount: chunkCount,	
 		Checksum:   checksum,
 	}); err != nil {
 		return failUpload(fmt.Errorf("write upload-completed WAL record: %w", err))
