@@ -101,6 +101,7 @@ func main() {
 
 	// Initialize shared storage client manager.
 	storageManager := rpc.NewStorageClientManager(nodeRegistry)
+	replicationManager := rpc.NewReplicationManager(storageManager)
 	defer storageManager.Close()
 
 	// Initialize shared WAL writer.
@@ -122,6 +123,7 @@ func main() {
 		fileRepo,
 		chunkRepo,
 		storageManager,
+		replicationManager,
 		walWriter,
 	)
 
@@ -158,6 +160,24 @@ func main() {
 	cancelRecovery()
 
 	log.Println("Upload recovery completed successfully")
+
+	// Start asynchronous replication after upload recovery.
+	replicationWorker := rpc.NewReplicationWorker(
+		chunkRepo,
+		storageManager,
+		10*time.Second,
+	)
+
+	replicationWorkerCtx, stopReplicationWorker := context.WithCancel(
+		context.Background(),
+	)
+
+	replicationWorkerDone := make(chan struct{})
+
+	go func() {
+		defer close(replicationWorkerDone)
+		replicationWorker.Run(replicationWorkerCtx)
+	}()
 
 	// HTTP server.
 	httpServer := &http.Server{
@@ -199,6 +219,16 @@ func main() {
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP graceful shutdown failed: %v", err)
+	}
+
+	// Stop asynchronous replication before closing storage clients.
+	stopReplicationWorker()
+
+	select {
+	case <-replicationWorkerDone:
+		log.Println("Replication worker shut down")
+	case <-time.After(5 * time.Second):
+		log.Println("Replication worker shutdown timed out")
 	}
 
 	// Stop node monitoring.

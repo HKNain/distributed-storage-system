@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/HKNain/distributed-storage-system/internal/chunker"
 	"github.com/HKNain/distributed-storage-system/internal/middleware"
@@ -25,26 +26,28 @@ const (
 )
 
 type FileController struct {
-	fileRepo       *repository.FileRepository
-	chunkRepo      *repository.ChunkRepository
-	storageManager *rpc.StorageClientManager
-	walWriter      *wal.Writer
+	fileRepo           *repository.FileRepository
+	chunkRepo          *repository.ChunkRepository
+	storageManager     *rpc.StorageClientManager
+	replicationManager *rpc.ReplicationManager
+	walWriter          *wal.Writer
 }
 
 func NewFileController(
 	fileRepo *repository.FileRepository,
 	chunkRepo *repository.ChunkRepository,
 	storageManager *rpc.StorageClientManager,
+	replicationManager *rpc.ReplicationManager,
 	walWriter *wal.Writer,
 ) *FileController {
 	return &FileController{
-		fileRepo:       fileRepo,
-		chunkRepo:      chunkRepo,
-		storageManager: storageManager,
-		walWriter:      walWriter,
+		fileRepo:           fileRepo,
+		chunkRepo:          chunkRepo,
+		storageManager:     storageManager,
+		replicationManager: replicationManager,
+		walWriter:          walWriter,
 	}
 }
-
 
 func (c *FileController) UploadFile(
 	ctx context.Context,
@@ -63,8 +66,10 @@ func (c *FileController) UploadFile(
 		return models.File{}, fmt.Errorf("invalid file size")
 	}
 
-	if c.walWriter == nil || c.storageManager  == nil {
-		return models.File{}, fmt.Errorf("WAL writer or storage node ID is not configured")
+	if c.walWriter == nil ||
+		c.storageManager == nil ||
+		c.replicationManager == nil {
+		return models.File{}, fmt.Errorf("upload dependencies are not configured")
 	}
 
 	file, err := c.fileRepo.CreateFile(models.File{
@@ -162,24 +167,45 @@ func (c *FileController) UploadFile(
 
 	chunkCount := 0
 
-	
 	err = chunker.Process(stagedReader, file.ID, func(chunk chunker.ChunkData) error {
-		// 1. Select an ACTIVE storage node using round-robin.
-		node, storageClient, err := c.storageManager.GetNextActiveNode()
+		// 1. Select the primary node.
+		primary, primaryClient, err := c.storageManager.GetNextActiveNode()
 		if err != nil {
-			return fmt.Errorf("select storage node for chunk %d: %w", chunk.Metadata.Index, err)
+			return fmt.Errorf("select primary node: %w", err)
 		}
 
-		// 2. Persist the selected node ID in chunk metadata.
+		// 2. Select two distinct replica nodes, excluding the primary.
+		replicaNodes, err := c.replicationManager.SelectReplicaNodes(
+			primary.NodeID,
+			2,
+		)
+		if err != nil {
+			return fmt.Errorf("select replica nodes: %w", err)
+		}
+
+		// 3. Prepare chunk metadata with all three assignments.
 		chunkMetadata := chunk.Metadata
-		chunkMetadata.StorageNodeID = node.NodeID
+		chunkMetadata.StorageNodeID = primary.NodeID
+		chunkMetadata.ReplicationFactor = 3
+		chunkMetadata.Replicas = []models.ChunkReplica{
+			{
+				NodeID:    replicaNodes[0].NodeID,
+				Status:    models.ReplicaStatusPending,
+				UpdatedAt: time.Now().UTC(),
+			},
+			{
+				NodeID:    replicaNodes[1].NodeID,
+				Status:    models.ReplicaStatusPending,
+				UpdatedAt: time.Now().UTC(),
+			},
+		}
 
 		metadata, err := c.chunkRepo.CreateChunk(chunkMetadata)
 		if err != nil {
 			return fmt.Errorf("create chunk metadata: %w", err)
 		}
 
-		// 3. Record the write intent before sending bytes.
+		// 4. Persist the complete placement decision before writing data.
 		startRecord := models.Record{
 			Event:      models.EventChunkWriteStarted,
 			FileID:     file.ID,
@@ -187,22 +213,19 @@ func (c *FileController) UploadFile(
 			ChunkIndex: metadata.Index,
 			ChunkSize:  metadata.Size,
 			Checksum:   metadata.Hash,
-			NodeID:     node.NodeID,
+			NodeID:     primary.NodeID,
+			ReplicaNodeIDs: []string{
+				replicaNodes[0].NodeID,
+				replicaNodes[1].NodeID,
+			},
 		}
 
 		if err := c.walWriter.Append(startRecord); err != nil {
 			return fmt.Errorf("write chunk-started WAL record: %w", err)
 		}
 
-		// 4. Store the chunk on its assigned node.
-		err = storageClient.StoreChunk(
-			ctx,
-			metadata.ID,
-			chunk.Data,
-			metadata.Hash,
-		)
-
-		if err != nil {
+		// Helper to record an unsuccessful quorum write.
+		failChunk := func(cause error) error {
 			_ = c.chunkRepo.UpdateChunkStatus(
 				metadata.ID,
 				models.ChunkStatusFailed,
@@ -215,23 +238,68 @@ func (c *FileController) UploadFile(
 				ChunkIndex: metadata.Index,
 				ChunkSize:  metadata.Size,
 				Checksum:   metadata.Hash,
-				NodeID:     node.NodeID,
-				Error:      err.Error(),
+				NodeID:     primary.NodeID,
+				Error:      cause.Error(),
 			})
 
 			if walErr != nil {
 				return fmt.Errorf(
-					"store chunk %d: %w (also failed to record WAL failure: %v)",
-					metadata.Index,
-					err,
+					"%w (also failed to record WAL failure: %v)",
+					cause,
 					walErr,
 				)
 			}
 
-			return fmt.Errorf("store chunk %d: %w", metadata.Index, err)
+			return cause
 		}
 
-		// 5. Record physical storage success in WAL.
+		// 5. Store on the primary.
+		if err := primaryClient.StoreChunk(
+			ctx,
+			metadata.ID,
+			chunk.Data,
+			metadata.Hash,
+		); err != nil {
+			return failChunk(fmt.Errorf("store primary chunk: %w", err))
+		}
+
+		// 6. Store synchronously on the first replica.
+		firstReplicaID := replicaNodes[0].NodeID
+
+		if err := c.replicationManager.ReplicateToNode(
+			ctx,
+			firstReplicaID,
+			metadata.ID,
+			chunk.Data,
+			metadata.Hash,
+		); err != nil {
+			_ = c.chunkRepo.UpdateChunkReplica(
+				metadata.ID,
+				models.ChunkReplica{
+					NodeID: firstReplicaID,
+					Status: models.ReplicaStatusFailed,
+				},
+			)
+
+			return failChunk(fmt.Errorf(
+				"store synchronous replica %s: %w",
+				firstReplicaID,
+				err,
+			))
+		}
+
+		// 7. Persist the successful replica write.
+		if err := c.chunkRepo.UpdateChunkReplica(
+			metadata.ID,
+			models.ChunkReplica{
+				NodeID: firstReplicaID,
+				Status: models.ReplicaStatusStored,
+			},
+		); err != nil {
+			return fmt.Errorf("update synchronous replica metadata: %w", err)
+		}
+
+		// 8. Record quorum success in the WAL.
 		if err := c.walWriter.Append(models.Record{
 			Event:      models.EventChunkWriteCommitted,
 			FileID:     file.ID,
@@ -239,12 +307,12 @@ func (c *FileController) UploadFile(
 			ChunkIndex: metadata.Index,
 			ChunkSize:  metadata.Size,
 			Checksum:   metadata.Hash,
-			NodeID:     node.NodeID,
+			NodeID:     primary.NodeID,
 		}); err != nil {
 			return fmt.Errorf("write chunk-committed WAL record: %w", err)
 		}
 
-		// 6. Update metadata only after the WAL commit.
+		// 9. Mark the chunk stored after both synchronous writes succeed.
 		if err := c.chunkRepo.UpdateChunkStatus(
 			metadata.ID,
 			models.ChunkStatusStored,
@@ -255,7 +323,6 @@ func (c *FileController) UploadFile(
 		chunkCount++
 		return nil
 	})
-
 
 	if err != nil {
 		return failUpload(fmt.Errorf("process file chunks: %w", err))
@@ -274,7 +341,7 @@ func (c *FileController) UploadFile(
 	if err := c.walWriter.Append(models.Record{
 		Event:      models.EventUploadCompleted,
 		FileID:     file.ID,
-		ChunkCount: chunkCount,	
+		ChunkCount: chunkCount,
 		Checksum:   checksum,
 	}); err != nil {
 		return failUpload(fmt.Errorf("write upload-completed WAL record: %w", err))

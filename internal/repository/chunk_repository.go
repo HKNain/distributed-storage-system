@@ -269,3 +269,95 @@ func isValidChunkStatus(status models.ChunkStatus) bool {
 		return false
 	}
 }
+
+// UpdateChunkReplica updates the status of a replica identified by its node ID.
+func (repo *ChunkRepository) UpdateChunkReplica(
+    chunkID string,
+    replica models.ChunkReplica,
+) error {
+    if chunkID == "" || replica.NodeID == "" {
+        return errors.New("chunk ID and replica node ID are required")
+    }
+
+    if replica.Status != models.ReplicaStatusPending &&
+        replica.Status != models.ReplicaStatusStored &&
+        replica.Status != models.ReplicaStatusFailed {
+        return errors.New("invalid replica status")
+    }
+
+    return repo.DB.Update(func(tx *bolt.Tx) error {
+        bucket := tx.Bucket(database.ChunksBucket)
+        if bucket == nil {
+            return errors.New("chunks bucket not found")
+        }
+
+        data := bucket.Get([]byte(chunkID))
+        if data == nil {
+            return ErrChunkNotFound
+        }
+
+        var chunk models.Chunk
+        if err := json.Unmarshal(data, &chunk); err != nil {
+            return err
+        }
+
+        found := false
+
+        for i := range chunk.Replicas {
+            if chunk.Replicas[i].NodeID == replica.NodeID {
+                chunk.Replicas[i].Status = replica.Status
+                chunk.Replicas[i].UpdatedAt = time.Now().UTC()
+                found = true
+                break
+            }
+        }
+
+        if !found {
+            return errors.New("replica node not found in chunk metadata")
+        }
+
+        updatedData, err := json.Marshal(chunk)
+        if err != nil {
+            return err
+        }
+
+        return bucket.Put([]byte(chunkID), updatedData)
+    })
+}
+
+// GetChunksWithPendingReplicas returns stored chunks that still have
+// at least one replica awaiting replication or retry.
+func (repo *ChunkRepository) GetChunksWithPendingReplicas() ([]models.Chunk, error) {
+	var chunks []models.Chunk
+
+	err := repo.DB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(database.ChunksBucket)
+		if bucket == nil {
+			return errors.New("chunks bucket not found")
+		}
+
+		return bucket.ForEach(func(_, value []byte) error {
+			var chunk models.Chunk
+
+			if err := json.Unmarshal(value, &chunk); err != nil {
+				return err
+			}
+
+			if chunk.Status != models.ChunkStatusStored {
+				return nil
+			}
+
+			for _, replica := range chunk.Replicas {
+				if replica.Status == models.ReplicaStatusPending ||
+					replica.Status == models.ReplicaStatusFailed {
+					chunks = append(chunks, chunk)
+					break
+				}
+			}
+
+			return nil
+		})
+	})
+
+	return chunks, err
+}

@@ -1,3 +1,4 @@
+
 package models
 
 import (
@@ -26,25 +27,24 @@ type Record struct {
 	Timestamp time.Time `json:"timestamp"`
 	Event     EventType `json:"event"`
 
-	// Upload information
 	FileID      string `json:"file_id"`
 	StagingPath string `json:"staging_path,omitempty"`
 	FileSize    int64  `json:"file_size,omitempty"`
 
-	// Chunk information
 	ChunkID    string `json:"chunk_id,omitempty"`
 	ChunkIndex int    `json:"chunk_index"`
 	ChunkSize  int64  `json:"chunk_size,omitempty"`
 	Checksum   string `json:"checksum,omitempty"`
 
-	// Storage node information
+	// Primary storage node.
 	NodeID string `json:"node_id,omitempty"`
 
-	// Completion information
-	ChunkCount int `json:"chunk_count,omitempty"`
+	// Replica destinations, excluding the primary.
+	// For replication factor 3, this contains two node IDs.
+	ReplicaNodeIDs []string `json:"replica_node_ids,omitempty"`
 
-	// Failure information
-	Error string `json:"error,omitempty"`
+	ChunkCount int    `json:"chunk_count,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 func (r Record) Validate() error {
@@ -53,7 +53,7 @@ func (r Record) Validate() error {
 	}
 
 	if r.Sequence == 0 {
-		return errors.New("WAL sequence cannot be zero")
+		return errors.New("WAL sequence must be greater than zero")
 	}
 
 	if r.Timestamp.IsZero() {
@@ -65,60 +65,96 @@ func (r Record) Validate() error {
 	}
 
 	switch r.Event {
-
 	case EventUploadStarted:
 		if r.StagingPath == "" {
 			return errors.New("staging path is required")
 		}
-
 		if r.FileSize < 0 {
 			return errors.New("file size cannot be negative")
 		}
 
-	case EventChunkWriteStarted,
-		EventChunkWriteCommitted,
-		EventChunkWriteFailed:
-
-		if r.ChunkID == "" {
-			return errors.New("chunk ID is required")
+	case EventChunkWriteStarted:
+		if err := r.validateChunkFields(); err != nil {
+			return err
+		}
+		if err := r.validateReplicaNodes(); err != nil {
+			return err
 		}
 
-		if r.NodeID == "" {
-			return errors.New("storage node ID is required")
-		}
+	case EventChunkWriteCommitted:
+		return r.validateChunkFields()
 
-		if r.ChunkIndex < 0 {
-			return errors.New("chunk index cannot be negative")
+	case EventChunkWriteFailed:
+		if err := r.validateChunkFields(); err != nil {
+			return err
 		}
-
-		if r.ChunkSize <= 0 {
-			return errors.New("chunk size must be positive")
-		}
-
-		if !isValidChecksum(r.Checksum) {
-			return errors.New("invalid SHA-256 checksum")
-		}
-
-		if r.Event == EventChunkWriteFailed && r.Error == "" {
-			return errors.New("failure reason is required")
+		if strings.TrimSpace(r.Error) == "" {
+			return errors.New("error is required for failed chunk writes")
 		}
 
 	case EventUploadCompleted:
 		if r.ChunkCount < 0 {
 			return errors.New("chunk count cannot be negative")
 		}
-
 		if !isValidChecksum(r.Checksum) {
-			return errors.New("invalid file checksum")
+			return errors.New("invalid upload checksum")
 		}
 
 	case EventUploadFailed:
-		if r.Error == "" {
-			return errors.New("failure reason is required")
+		if strings.TrimSpace(r.Error) == "" {
+			return errors.New("error is required for failed uploads")
 		}
 
 	default:
-		return errors.New("unknown WAL event type")
+		return errors.New("unknown WAL event")
+	}
+
+	return nil
+}
+
+func (r Record) validateChunkFields() error {
+	if strings.TrimSpace(r.ChunkID) == "" {
+		return errors.New("chunk ID is required")
+	}
+
+	if strings.TrimSpace(r.NodeID) == "" {
+		return errors.New("storage node ID is required")
+	}
+
+	if r.ChunkIndex < 0 {
+		return errors.New("chunk index cannot be negative")
+	}
+
+	if r.ChunkSize <= 0 {
+		return errors.New("chunk size must be greater than zero")
+	}
+
+	if !isValidChecksum(r.Checksum) {
+		return errors.New("invalid chunk checksum")
+	}
+
+	return nil
+}
+
+func (r Record) validateReplicaNodes() error {
+	seen := make(map[string]struct{}, len(r.ReplicaNodeIDs))
+
+	for _, nodeID := range r.ReplicaNodeIDs {
+		nodeID = strings.TrimSpace(nodeID)
+
+		if nodeID == "" {
+			return errors.New("replica node ID cannot be empty")
+		}
+
+		if nodeID == r.NodeID {
+			return errors.New("primary node cannot also be a replica")
+		}
+
+		if _, exists := seen[nodeID]; exists {
+			return errors.New("duplicate replica node ID")
+		}
+
+		seen[nodeID] = struct{}{}
 	}
 
 	return nil

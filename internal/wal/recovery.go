@@ -18,16 +18,17 @@ const (
 type ChunkRecoveryState string
 
 const (
-	ChunkUncertain  ChunkRecoveryState = "UNCERTAIN"
-	ChunkCommitted  ChunkRecoveryState = "COMMITTED"
+	ChunkUncertain ChunkRecoveryState = "UNCERTAIN"
+	ChunkCommitted ChunkRecoveryState = "COMMITTED"
 )
 
 type ChunkRecovery struct {
-	ChunkID  string
-	Index    int
-	NodeID   string
-	Checksum string
-	Size     int64
+	ChunkID        string
+	Index          int
+	NodeID         string
+	ReplicaNodeIDs []string
+	Checksum       string
+	Size           int64
 
 	State   ChunkRecoveryState
 	Started *models.Record
@@ -111,13 +112,14 @@ func BuildRecoveryPlans(records []models.Record) (map[string]*UploadRecoveryPlan
 			}
 
 			plan.Chunks[record.ChunkIndex] = &ChunkRecovery{
-				ChunkID:  record.ChunkID,
-				Index:    record.ChunkIndex,
-				NodeID:   record.NodeID,
-				Checksum: record.Checksum,
-				Size:     record.ChunkSize,
-				State:    ChunkUncertain,
-				Started:  &current,
+				ChunkID:        record.ChunkID,
+				Index:          record.ChunkIndex,
+				NodeID:         record.NodeID,
+				ReplicaNodeIDs: append([]string(nil), record.ReplicaNodeIDs...),
+				Checksum:       record.Checksum,
+				Size:           record.ChunkSize,
+				State:          ChunkUncertain,
+				Started:        &current,
 			}
 
 		case models.EventChunkWriteCommitted:
