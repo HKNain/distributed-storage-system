@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/HKNain/distributed-storage-system/internal/middleware"
 	"github.com/HKNain/distributed-storage-system/internal/models"
@@ -21,6 +22,7 @@ var (
 	ErrDownloadNotFound  = errors.New("file not found")
 	ErrFileNotAvailable  = errors.New("file is not available for download")
 	ErrFileIntegrity     = errors.New("file integrity verification failed")
+	ErrChunkUnavailable = errors.New("no valid chunk copy is available")
 )
 
 func (c *FileController) DownloadFile(
@@ -104,59 +106,25 @@ func (c *FileController) DownloadFile(
 
 		// New chunks have StorageNodeID in their metadata.
 		// Older chunks may need the legacy node fallback.
-		nodeID := chunk.StorageNodeID
-		if nodeID == "" {
-			nodeID = legacyStorageNodeID()
-		}
-
-		if nodeID == "" {
-			return cleanup(fmt.Errorf(
-				"storage node ID is missing for chunk %s; configure LEGACY_STORAGE_NODE_ID for legacy chunks",
-				chunk.ID,
-			))
-		}
-
-		// Retrieve the client for this exact node.
-		// Do not read from another node if this one is unavailable.
-		storageClient, err := c.storageManager.GetClientForNode(nodeID)
+		// Retrieve a verified copy from the primary or one of its replicas.
+		data, sourceNodeID, err := c.retrieveVerifiedChunk(ctx, chunk)
 		if err != nil {
 			return cleanup(fmt.Errorf(
-				"get storage client for chunk %s on node %q: %w",
+				"retrieve chunk %s (index %d): %w",
 				chunk.ID,
-				nodeID,
+				i,
 				err,
 			))
 		}
 
-		data, err := storageClient.GetChunk(ctx, chunk.ID)
-		if err != nil {
-			return cleanup(fmt.Errorf(
-				"retrieve chunk %s from node %q: %w",
+		// Log which node supplied the chunk.
+		if sourceNodeID != chunk.StorageNodeID {
+			fmt.Printf(
+				"Chunk %s recovered from replica node %s (primary: %s)\n",
 				chunk.ID,
-				nodeID,
-				err,
-			))
-		}
-
-		// Verify chunk size.
-		if int64(len(data)) != chunk.Size {
-			return cleanup(fmt.Errorf(
-				"%w: chunk %d size mismatch",
-				ErrFileIntegrity,
-				i,
-			))
-		}
-
-		// Verify individual chunk checksum.
-		chunkHash := sha256.Sum256(data)
-		actualHash := hex.EncodeToString(chunkHash[:])
-
-		if actualHash != chunk.Hash {
-			return cleanup(fmt.Errorf(
-				"%w: chunk %d checksum mismatch",
-				ErrFileIntegrity,
-				i,
-			))
+				sourceNodeID,
+				chunk.StorageNodeID,
+			)
 		}
 
 		// Write verified chunk to temporary file.
@@ -199,6 +167,143 @@ func (c *FileController) DownloadFile(
 	return &file, tempFile, nil
 }
 
+// retrieveVerifiedChunk tries the primary first, followed by replicas.
+// It returns only data that passes both size and SHA-256 verification.
+func (c *FileController) retrieveVerifiedChunk(
+    ctx context.Context,
+    chunk models.Chunk,
+) ([]byte, string, error) {
+
+    type candidate struct {
+        nodeID string
+        role   string
+    }
+
+    candidates := make([]candidate, 0, 1+len(chunk.Replicas))
+    seen := make(map[string]struct{})
+
+    // Primary node first.
+    primaryNodeID := chunk.StorageNodeID
+    if primaryNodeID == "" {
+        primaryNodeID = legacyStorageNodeID()
+    }
+
+    if primaryNodeID != "" {
+        candidates = append(candidates, candidate{
+            nodeID: primaryNodeID,
+            role:   "primary",
+        })
+        seen[primaryNodeID] = struct{}{}
+    }
+
+    // Only use replicas whose metadata says they are stored.
+    for _, replica := range chunk.Replicas {
+        if replica.Status != models.ReplicaStatusStored {
+            continue
+        }
+
+        if replica.NodeID == "" {
+            continue
+        }
+
+        if _, exists := seen[replica.NodeID]; exists {
+            continue
+        }
+
+        candidates = append(candidates, candidate{
+            nodeID: replica.NodeID,
+            role:   "replica",
+        })
+        seen[replica.NodeID] = struct{}{}
+    }
+
+    if len(candidates) == 0 {
+        return nil, "", fmt.Errorf(
+            "%w: chunk %s has no assigned primary or stored replicas",
+            ErrChunkUnavailable,
+            chunk.ID,
+        )
+    }
+
+    var failures []string
+    integrityFailure := false
+
+    for _, candidate := range candidates {
+        if err := ctx.Err(); err != nil {
+            return nil, "", err
+        }
+
+        storageClient, err := c.storageManager.GetClientForNode(candidate.nodeID)
+        if err != nil {
+            failures = append(failures, fmt.Sprintf(
+                "%s node %s: client unavailable: %v",
+                candidate.role,
+                candidate.nodeID,
+                err,
+            ))
+            continue
+        }
+
+        data, err := storageClient.GetChunk(ctx, chunk.ID)
+        if err != nil {
+            failures = append(failures, fmt.Sprintf(
+                "%s node %s: retrieval failed: %v",
+                candidate.role,
+                candidate.nodeID,
+                err,
+            ))
+            continue
+        }
+
+        // Verify chunk size.
+        if int64(len(data)) != chunk.Size {
+            integrityFailure = true
+            failures = append(failures, fmt.Sprintf(
+                "%s node %s: size mismatch (expected %d, got %d)",
+                candidate.role,
+                candidate.nodeID,
+                chunk.Size,
+                len(data),
+            ))
+            continue
+        }
+
+        // Verify SHA-256 checksum.
+        hash := sha256.Sum256(data)
+        actualHash := hex.EncodeToString(hash[:])
+
+        if actualHash != chunk.Hash {
+            integrityFailure = true
+            failures = append(failures, fmt.Sprintf(
+                "%s node %s: checksum mismatch",
+                candidate.role,
+                candidate.nodeID,
+            ))
+            continue
+        }
+
+        return data, candidate.nodeID, nil
+    }
+
+    failureDetails := strings.Join(failures, "; ")
+
+    if integrityFailure {
+        return nil, "", fmt.Errorf(
+            "%w: no valid copy of chunk %s; attempts: %s",
+            ErrFileIntegrity,
+            chunk.ID,
+            failureDetails,
+        )
+    }
+
+    return nil, "", fmt.Errorf(
+        "%w: chunk %s; attempts: %s",
+        ErrChunkUnavailable,
+        chunk.ID,
+        failureDetails,
+    )
+}
+
 // DownloadHandler handles HTTP file downloads.
 func (c *FileController) DownloadHandler(
 	w http.ResponseWriter,
@@ -234,6 +339,13 @@ func (c *FileController) DownloadHandler(
 				w,
 				"File integrity verification failed",
 				http.StatusInternalServerError,
+			)
+
+		case errors.Is(err, ErrChunkUnavailable):
+			http.Error(
+				w,
+				"No valid copy of one or more file chunks is currently available",
+				http.StatusServiceUnavailable,
 			)
 
 		default:
