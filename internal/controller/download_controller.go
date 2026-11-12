@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/HKNain/distributed-storage-system/internal/middleware"
 	"github.com/HKNain/distributed-storage-system/internal/models"
@@ -169,140 +171,122 @@ func (c *FileController) DownloadFile(
 
 // retrieveVerifiedChunk tries the primary first, followed by replicas.
 // It returns only data that passes both size and SHA-256 verification.
-func (c *FileController) retrieveVerifiedChunk(
-    ctx context.Context,
-    chunk models.Chunk,
+
+func (fc *FileController) retrieveVerifiedChunk(
+	ctx context.Context,
+	chunk models.Chunk,
 ) ([]byte, string, error) {
+	type candidate struct {
+		nodeID string
+	}
 
-    type candidate struct {
-        nodeID string
-        role   string
-    }
+	candidates := make([]candidate, 0, 1+len(chunk.Replicas))
+	seen := make(map[string]bool)
 
-    candidates := make([]candidate, 0, 1+len(chunk.Replicas))
-    seen := make(map[string]struct{})
+	addCandidate := func(nodeID string) {
+		if nodeID == "" || seen[nodeID] {
+			return
+		}
 
-    // Primary node first.
-    primaryNodeID := chunk.StorageNodeID
-    if primaryNodeID == "" {
-        primaryNodeID = legacyStorageNodeID()
-    }
+		seen[nodeID] = true
+		candidates = append(candidates, candidate{nodeID: nodeID})
+	}
 
-    if primaryNodeID != "" {
-        candidates = append(candidates, candidate{
-            nodeID: primaryNodeID,
-            role:   "primary",
-        })
-        seen[primaryNodeID] = struct{}{}
-    }
+	// Inspect the primary and every assigned replica, including replicas
+	// whose metadata currently says PENDING or FAILED.
+	addCandidate(chunk.StorageNodeID)
 
-    // Only use replicas whose metadata says they are stored.
-    for _, replica := range chunk.Replicas {
-        if replica.Status != models.ReplicaStatusStored {
-            continue
-        }
+	for _, replica := range chunk.Replicas {
+		addCandidate(replica.NodeID)
+	}
 
-        if replica.NodeID == "" {
-            continue
-        }
+	var (
+		healthyData   []byte
+		healthySource string
+		unhealthy     = make(map[string]string)
+		sawIntegrityFailure bool
+	)
 
-        if _, exists := seen[replica.NodeID]; exists {
-            continue
-        }
+	for _, candidate := range candidates {
+		nodeID := candidate.nodeID
 
-        candidates = append(candidates, candidate{
-            nodeID: replica.NodeID,
-            role:   "replica",
-        })
-        seen[replica.NodeID] = struct{}{}
-    }
+		client, err := fc.storageManager.GetClientForNode(nodeID)
+		if err != nil {
+			// The node may simply be unavailable. Do not assume corruption.
+			unhealthy[nodeID] = "UNAVAILABLE"
+			continue
+		}
 
-    if len(candidates) == 0 {
-        return nil, "", fmt.Errorf(
-            "%w: chunk %s has no assigned primary or stored replicas",
-            ErrChunkUnavailable,
-            chunk.ID,
-        )
-    }
+		data, err := client.GetChunk(ctx, chunk.ID)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				unhealthy[nodeID] = "MISSING"
+				sawIntegrityFailure = true
+			} else {
+				unhealthy[nodeID] = "UNAVAILABLE"
+			}
+			continue
+		}
 
-    var failures []string
-    integrityFailure := false
+		hash := sha256.Sum256(data)
+		checksum := hex.EncodeToString(hash[:])
 
-    for _, candidate := range candidates {
-        if err := ctx.Err(); err != nil {
-            return nil, "", err
-        }
+		if int64(len(data)) != chunk.Size || checksum != chunk.Hash {
+			unhealthy[nodeID] = "CORRUPTED"
+			sawIntegrityFailure = true
+			continue
+		}
 
-        storageClient, err := c.storageManager.GetClientForNode(candidate.nodeID)
-        if err != nil {
-            failures = append(failures, fmt.Sprintf(
-                "%s node %s: client unavailable: %v",
-                candidate.role,
-                candidate.nodeID,
-                err,
-            ))
-            continue
-        }
+		// Retain the first verified copy, but continue inspecting
+		// the remaining copies to detect additional unhealthy replicas.
+		if healthyData == nil {
+			healthyData = data
+			healthySource = nodeID
+		}
+	}
 
-        data, err := storageClient.GetChunk(ctx, chunk.ID)
-        if err != nil {
-            failures = append(failures, fmt.Sprintf(
-                "%s node %s: retrieval failed: %v",
-                candidate.role,
-                candidate.nodeID,
-                err,
-            ))
-            continue
-        }
+	// Schedule repairs only after inspecting every assigned copy.
+	// Scheduling errors must not prevent a successful download.
+	for nodeID, reason := range unhealthy {
+		if fc.repairCoordinator == nil {
+			fmt.Printf(
+				"repair unavailable: coordinator not initialized (chunk=%s target=%s reason=%s)\n",
+				chunk.ID,
+				nodeID,
+				reason,
+			)
+			continue
+		}
 
-        // Verify chunk size.
-        if int64(len(data)) != chunk.Size {
-            integrityFailure = true
-            failures = append(failures, fmt.Sprintf(
-                "%s node %s: size mismatch (expected %d, got %d)",
-                candidate.role,
-                candidate.nodeID,
-                chunk.Size,
-                len(data),
-            ))
-            continue
-        }
+		if err := fc.repairCoordinator.ScheduleRepair(chunk, nodeID, reason); err != nil {
+			fmt.Printf(
+				"failed to schedule repair (chunk=%s target=%s): %v\n",
+				chunk.ID,
+				nodeID,
+				err,
+			)
+		}
+	}
 
-        // Verify SHA-256 checksum.
-        hash := sha256.Sum256(data)
-        actualHash := hex.EncodeToString(hash[:])
+	if healthyData != nil {
+		return healthyData, healthySource, nil
+	}
 
-        if actualHash != chunk.Hash {
-            integrityFailure = true
-            failures = append(failures, fmt.Sprintf(
-                "%s node %s: checksum mismatch",
-                candidate.role,
-                candidate.nodeID,
-            ))
-            continue
-        }
+	if sawIntegrityFailure {
+		return nil, "", fmt.Errorf(
+			"%w: no valid copy found for chunk %s",
+			ErrFileIntegrity,
+			chunk.ID,
+		)
+	}
 
-        return data, candidate.nodeID, nil
-    }
-
-    failureDetails := strings.Join(failures, "; ")
-
-    if integrityFailure {
-        return nil, "", fmt.Errorf(
-            "%w: no valid copy of chunk %s; attempts: %s",
-            ErrFileIntegrity,
-            chunk.ID,
-            failureDetails,
-        )
-    }
-
-    return nil, "", fmt.Errorf(
-        "%w: chunk %s; attempts: %s",
-        ErrChunkUnavailable,
-        chunk.ID,
-        failureDetails,
-    )
+	return nil, "", fmt.Errorf(
+		"%w: no available copy found for chunk %s",
+		ErrChunkUnavailable,
+		chunk.ID,
+	)
 }
+
 
 // DownloadHandler handles HTTP file downloads.
 func (c *FileController) DownloadHandler(

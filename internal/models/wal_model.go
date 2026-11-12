@@ -19,6 +19,9 @@ const (
 	EventChunkWriteFailed    EventType = "CHUNK_WRITE_FAILED"
 	EventUploadCompleted     EventType = "UPLOAD_COMPLETED"
 	EventUploadFailed        EventType = "UPLOAD_FAILED"
+	EventChunkRepairStarted   EventType = "CHUNK_REPAIR_STARTED"
+	EventChunkRepairCommitted EventType = "CHUNK_REPAIR_COMMITTED"
+	EventChunkRepairFailed    EventType = "CHUNK_REPAIR_FAILED"
 )
 
 type Record struct {
@@ -35,6 +38,11 @@ type Record struct {
 	ChunkIndex int    `json:"chunk_index"`
 	ChunkSize  int64  `json:"chunk_size,omitempty"`
 	Checksum   string `json:"checksum,omitempty"`
+
+	// Repair operation details.
+	RepairID      string `json:"repair_id,omitempty"`
+	SourceNodeID  string `json:"source_node_id,omitempty"`
+	RepairReason  string `json:"repair_reason,omitempty"`
 
 	// Primary storage node.
 	NodeID string `json:"node_id,omitempty"`
@@ -105,6 +113,14 @@ func (r Record) Validate() error {
 			return errors.New("error is required for failed uploads")
 		}
 
+	case EventChunkRepairStarted,
+		EventChunkRepairCommitted,
+		EventChunkRepairFailed:
+
+		if err := r.validateRepairFields(); err != nil {
+			return err
+		}
+
 	default:
 		return errors.New("unknown WAL event")
 	}
@@ -167,4 +183,50 @@ func isValidChecksum(checksum string) bool {
 
 	decoded, err := hex.DecodeString(checksum)
 	return err == nil && len(decoded) == 32
+}
+
+func (r Record) validateRepairFields() error {
+    if strings.TrimSpace(r.RepairID) == "" {
+        return errors.New("repair ID is required")
+    }
+
+    if strings.TrimSpace(r.ChunkID) == "" {
+        return errors.New("chunk ID is required")
+    }
+
+    if strings.TrimSpace(r.NodeID) == "" {
+        return errors.New("repair target node ID is required")
+    }
+
+    if r.ChunkSize <= 0 {
+        return errors.New("repair chunk size must be positive")
+    }
+
+    if len(r.Checksum) != 64 {
+        return errors.New("invalid repair checksum length")
+    }
+
+    decoded, err := hex.DecodeString(r.Checksum)
+    if err != nil || len(decoded) != 32 {
+        return errors.New("invalid repair checksum")
+    }
+
+    switch r.Event {
+    case EventChunkRepairStarted:
+        if strings.TrimSpace(r.RepairReason) == "" {
+            return errors.New("repair reason is required")
+        }
+
+    case EventChunkRepairCommitted:
+        if strings.TrimSpace(r.SourceNodeID) == "" {
+            return errors.New("repair source node ID is required")
+        }
+
+    case EventChunkRepairFailed:
+        if strings.TrimSpace(r.Error) == "" {
+            return errors.New("repair failure reason is required")
+        }
+    }
+
+    return nil
 }

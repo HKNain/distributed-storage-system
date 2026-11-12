@@ -241,3 +241,24 @@ func validateCompletedUpload(
 
 	return nil
 }
+
+func BuildUploadRecoveryPlans(
+	records []models.Record,
+) (map[string]*UploadRecoveryPlan, error) {
+	uploadRecords := make([]models.Record, 0, len(records))
+
+	for _, record := range records {
+		switch record.Event {
+		case models.EventUploadStarted,
+			models.EventChunkWriteStarted,
+			models.EventChunkWriteCommitted,
+			models.EventChunkWriteFailed,
+			models.EventUploadCompleted,
+			models.EventUploadFailed:
+
+			uploadRecords = append(uploadRecords, record)
+		}
+	}
+
+	return BuildRecoveryPlans(uploadRecords)
+}

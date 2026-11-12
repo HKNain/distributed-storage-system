@@ -31,6 +31,7 @@ type FileController struct {
 	storageManager     *rpc.StorageClientManager
 	replicationManager *rpc.ReplicationManager
 	walWriter          *wal.Writer
+	repairCoordinator *rpc.RepairCoordinator
 }
 
 func NewFileController(
@@ -39,6 +40,7 @@ func NewFileController(
 	storageManager *rpc.StorageClientManager,
 	replicationManager *rpc.ReplicationManager,
 	walWriter *wal.Writer,
+	repairCoordinator *rpc.RepairCoordinator,
 ) *FileController {
 	return &FileController{
 		fileRepo:           fileRepo,
@@ -46,6 +48,7 @@ func NewFileController(
 		storageManager:     storageManager,
 		replicationManager: replicationManager,
 		walWriter:          walWriter,
+		repairCoordinator:  repairCoordinator,
 	}
 }
 

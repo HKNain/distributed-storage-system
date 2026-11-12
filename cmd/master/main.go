@@ -116,6 +116,17 @@ func main() {
 		}
 	}()
 
+	repairWorker := rpc.NewRepairWorker(
+		chunkRepo,
+		storageManager,
+		walWriter,
+	)
+
+	repairCoordinator := rpc.NewRepairCoordinator(
+		walWriter,
+		repairWorker,
+	)
+
 	// Controllers.
 	authController := controller.NewAuthController(userRepo)
 
@@ -125,6 +136,7 @@ func main() {
 		storageManager,
 		replicationManager,
 		walWriter,
+		repairCoordinator,
 	)
 
 	// JWT authentication middleware.
@@ -179,6 +191,16 @@ func main() {
 		replicationWorker.Run(replicationWorkerCtx)
 	}()
 
+	repairCtx, stopRepairWorker := context.WithCancel(context.Background())
+	repairDone := make(chan struct{})
+
+	go func() {
+		defer close(repairDone)
+		repairWorker.Run(repairCtx, 10*time.Second)
+	}()
+
+	
+
 	// HTTP server.
 	httpServer := &http.Server{
 		Addr:              ":3000",
@@ -221,6 +243,15 @@ func main() {
 		log.Printf("HTTP graceful shutdown failed: %v", err)
 	}
 
+	// Stop repair worker before closing WAL and storage clients.
+	stopRepairWorker()
+
+	select {
+	case <-repairDone:
+		log.Println("Repair worker shut down")
+	case <-time.After(5 * time.Second):
+		log.Println("Repair worker shutdown timed out")
+	}
 	// Stop asynchronous replication before closing storage clients.
 	stopReplicationWorker()
 

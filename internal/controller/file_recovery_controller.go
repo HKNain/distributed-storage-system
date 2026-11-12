@@ -32,7 +32,7 @@ func (c *FileController) RecoverInterruptedUploads(ctx context.Context) error {
 		return fmt.Errorf("read WAL: %w", err)
 	}
 
-	plans, err := wal.BuildRecoveryPlans(records)
+	plans, err := wal.BuildUploadRecoveryPlans(records)
 	if err != nil {
 		return fmt.Errorf("build recovery plans: %w", err)
 	}
