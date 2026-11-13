@@ -5,10 +5,13 @@ import (
 	"errors"
 	"strings"
 	"time"
-
+	"crypto/rand"
+	"fmt"
+	
 	"github.com/HKNain/distributed-storage-system/internal/database"
 	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/google/uuid"
+	"github.com/HKNain/distributed-storage-system/internal/raftcluster"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -22,6 +25,7 @@ var (
 
 type UserRepository struct {
 	DB *bolt.DB
+	metadata *raftcluster.MetadataService
 }
 
 func NewUserRepository(db *bolt.DB) *UserRepository {
@@ -30,59 +34,53 @@ func NewUserRepository(db *bolt.DB) *UserRepository {
 	}
 }
 
+func NewUserRepositoryWithMetadata(
+    db *bolt.DB,
+    metadata *raftcluster.MetadataService,
+) *UserRepository {
+    return &UserRepository{
+        DB:       db,
+        metadata: metadata,
+    }
+}
+
 // CreateUser stores a new user.
-func (repo *UserRepository) CreateUser(user models.User) error {
+func (r *UserRepository) CreateUser(user models.User) error {
+    if r.metadata == nil {
+        return errors.New("raft metadata service is not configured")
+    }
 
-	return repo.DB.Update(func(tx *bolt.Tx) error {
+    user.Username = strings.ToLower(strings.TrimSpace(user.Username))
+    user.Email = strings.ToLower(strings.TrimSpace(user.Email))
 
-		bucket := tx.Bucket(database.UsersBucket)
-		if bucket == nil {
-			return errors.New("users bucket not found")
-		}
+    if user.Username == "" || user.Email == "" || user.Password == "" {
+        return errors.New("username, email and password are required")
+    }
 
-		username := strings.ToLower(user.Username)
-		id, err := generateUniqueUserID(bucket)
-		if err != nil {
-			return err
-		}
-		user.ID = id
+    // Generate identity and timestamps before submitting the Raft command.
+    user.ID = newUserID()
+    now := time.Now().UTC()
+    user.CreatedAt = now
+    user.UpdatedAt = now
 
-		// Check username uniqueness.
-		if bucket.Get([]byte(username)) != nil {
-			return ErrUserExists
-		}
+    payload, err := json.Marshal(user)
+    if err != nil {
+        return fmt.Errorf("marshal user: %w", err)
+    }
 
-		// Check email uniqueness.
-		err = bucket.ForEach(func(k, v []byte) error {
-			var existingUser models.User
+    err = r.metadata.CreateUser(payload)
+    if err != nil {
+        switch err.Error() {
+        case "USERNAME_EXISTS":
+            return ErrUserExists
+        case "EMAIL_EXISTS":
+            return ErrEmailExists
+        default:
+            return fmt.Errorf("raft user creation failed: %w", err)
+        }
+    }
 
-			if err := json.Unmarshal(v, &existingUser); err != nil {
-				return err
-			}
-
-			if strings.EqualFold(existingUser.Email, user.Email) {
-				return ErrEmailExists
-			}
-
-			return nil
-		})
-
-		if err != nil {
-			return err
-		}
-
-		now := time.Now().UTC()
-
-		user.CreatedAt = now
-		user.UpdatedAt = now
-
-		data, err := json.Marshal(user)
-		if err != nil {
-			return err
-		}
-
-		return bucket.Put([]byte(username), data)
-	})
+    return nil
 }
 
 // GetUserByUsername retrieves a user using username.
@@ -177,4 +175,21 @@ func generateUniqueUserID(bucket *bolt.Bucket) (string, error) {
             return id, nil
         }
     }
+}
+
+func newUserID() string {
+    id := make([]byte, 16)
+
+    if _, err := rand.Read(id); err != nil {
+        panic(fmt.Sprintf("failed to generate user ID: %v", err))
+    }
+
+    // UUID v4 version and variant bits.
+    id[6] = (id[6] & 0x0f) | 0x40
+    id[8] = (id[8] & 0x3f) | 0x80
+
+    return fmt.Sprintf(
+        "%x-%x-%x-%x-%x",
+        id[0:4], id[4:6], id[6:8], id[8:10], id[10:16],
+    )
 }

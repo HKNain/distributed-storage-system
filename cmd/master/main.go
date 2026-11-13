@@ -14,6 +14,12 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"path/filepath"
+	"strings"
+
+	"github.com/HKNain/distributed-storage-system/internal/raftcluster"
+	"strconv"
+
 	"github.com/HKNain/distributed-storage-system/internal/controller"
 	"github.com/HKNain/distributed-storage-system/internal/database"
 	"github.com/HKNain/distributed-storage-system/internal/middleware"
@@ -36,14 +42,97 @@ func main() {
 	}
 
 	// Database.
-	db, err := database.OpenDB("data/storage.db")
+	// Master-specific data directory.
+	dataDir := os.Getenv("MASTER_DATA_DIR")
+	if dataDir == "" {
+		log.Fatal("MASTER_DATA_DIR is not configured")
+	}
+
+	dbPath := filepath.Join(dataDir, "storage.db")
+
+	// Open this master's local metadata database.
+	db, err := database.OpenDB(dbPath)
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
 	}
 	defer db.Close()
 
+	// Initialize the Raft FSM using this master's local database.
+	fsm, err := raftcluster.NewMetadataFSM(db)
+
+	// Parse initial Raft peers.
+	var peers []raftcluster.Peer
+
+	peerConfig := os.Getenv("MASTER_RAFT_PEERS")
+	for _, entry := range strings.Split(peerConfig, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			log.Fatalf("Invalid MASTER_RAFT_PEERS entry: %q", entry)
+		}
+
+		peers = append(peers, raftcluster.Peer{
+			ID:      parts[0],
+			Address: parts[1],
+		})
+	}
+
+	bootstrap, err := strconv.ParseBool(os.Getenv("MASTER_RAFT_BOOTSTRAP"))
+	if err != nil {
+		log.Fatal("Invalid MASTER_RAFT_BOOTSTRAP:", err)
+	}
+
+	raftConfig := raftcluster.Config{
+		NodeID:          os.Getenv("MASTER_NODE_ID"),
+		BindAddress:     os.Getenv("MASTER_RAFT_BIND_ADDRESS"),
+		AdvertiseAddress: os.Getenv("MASTER_RAFT_ADVERTISE_ADDRESS"),
+		DataDir:         filepath.Join(dataDir, "raft"),
+		Bootstrap:       bootstrap,
+		Peers:           peers,
+	}
+
+	if raftConfig.NodeID == "" {
+		log.Fatal("MASTER_NODE_ID is not configured")
+	}
+
+	// Start this master's Raft node.
+	raftNode, err := raftcluster.Start(raftConfig, fsm)
+	if err != nil {
+		log.Fatal("Failed to start Raft node:", err)
+	}
+	defer raftNode.Shutdown()
+
+	// Wait for a Raft leader to be elected.
+	leaderCtx, cancelLeader := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancelLeader()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if raftNode.Raft.Leader() != "" {
+			log.Printf(
+				"Raft leader elected: %s (local node: %s)",
+				raftNode.Raft.Leader(),
+				raftConfig.NodeID,
+			)
+			break
+		}
+
+		select {
+		case <-leaderCtx.Done():
+			log.Fatal("Raft leader election timed out")
+		case <-ticker.C:
+		}
+	}
+
+	// Metadata service submits mutations through Raft.
+	metadataService,err := raftcluster.NewMetadataService(raftNode.Raft)
+
 	// Repositories.
-	userRepo := repository.NewUserRepository(db)
+	userRepo := repository.NewUserRepositoryWithMetadata(db, metadataService)
 	fileRepo := repository.NewFileRepository(db)
 	chunkRepo := repository.NewChunkRepository(db)
 
@@ -52,7 +141,7 @@ func main() {
 
 	// Start master gRPC server before waiting for storage nodes.
 	masterGRPC, masterListener, err := rpc.StartMasterGRPCServer(
-		":4000",
+		os.Getenv("MASTER_GRPC_ADDRESS"),
 		nodeRegistry,
 	)
 	if err != nil {
@@ -85,19 +174,12 @@ func main() {
 	}
 
 	// Wait for storage nodes to register and become active.
-	waitCtx, cancelWait := context.WithTimeout(
-		context.Background(),
-		30*time.Second,
+	// Storage nodes register asynchronously through heartbeats.
+	// Do not block master startup waiting for storage nodes.
+	log.Printf(
+		"Waiting asynchronously for %d storage nodes",
+		nodeCount,
 	)
-
-	if err := nodeRegistry.WaitForActiveNodes(waitCtx, nodeCount); err != nil {
-		cancelWait()
-		log.Fatalf("Storage nodes did not become ready: %v", err)
-	}
-
-	cancelWait()
-
-	log.Printf("%d storage nodes are active", nodeCount)
 
 	// Initialize shared storage client manager.
 	storageManager := rpc.NewStorageClientManager(nodeRegistry)
@@ -105,7 +187,7 @@ func main() {
 	defer storageManager.Close()
 
 	// Initialize shared WAL writer.
-	walWriter, err := wal.OpenWriter("data/wal/uploads.wal")
+	walWriter, err := wal.OpenWriter(filepath.Join(dataDir, "wal", "uploads.wal"))
 	if err != nil {
 		log.Fatal("Failed to initialize WAL:", err)
 	}
@@ -203,7 +285,7 @@ func main() {
 
 	// HTTP server.
 	httpServer := &http.Server{
-		Addr:              ":3000",
+		Addr:              os.Getenv("MASTER_HTTP_ADDRESS"),
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}

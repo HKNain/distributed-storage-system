@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"strings"
 
 	"github.com/joho/godotenv"
 
@@ -49,10 +50,12 @@ func main() {
 		storageDir = "data/chunks"
 	}
 
-	masterAddress := os.Getenv("MASTER_GRPC_ADDRESS")
-	if masterAddress == "" {
-		masterAddress = "localhost:4000"
+	masterAddressesEnv := os.Getenv("MASTER_ADDRESSES")
+	if masterAddressesEnv == "" {
+		log.Fatal("MASTER_ADDRESSES environment variable is required")
 	}
+
+	masterAddresses := strings.Split(masterAddressesEnv, ",")
 
 	// Initialize disk storage.
 	diskStorage, err := storage.NewDiskStorage(storageDir)
@@ -97,18 +100,18 @@ func main() {
 	log.Printf("Storage Node %s started", nodeID)
 	log.Printf("Listening address: %s", nodeAddress)
 	log.Printf("Storage directory: %s", storageDir)
-	log.Printf("Master address: %s", masterAddress)
+	log.Printf("Master addresses: %v", masterAddresses)
 	log.Printf("Heartbeat interval: %s", rpc.HeartbeatIntervalFromEnv())
 
 	// Start heartbeat client.
 	go func() {
-		if err := rpc.RunHeartbeatClient(
+		if err := rpc.RunHeartbeatClients(
 			ctx,
-			masterAddress,
+			masterAddresses,
 			nodeID,
 			nodeAddress,
 		); err != nil {
-			log.Printf("Heartbeat client error for %s: %v", nodeID, err)
+			log.Printf("Heartbeat clients error for %s: %v", nodeID, err)
 		}
 	}()
 

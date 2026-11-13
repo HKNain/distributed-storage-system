@@ -4,6 +4,9 @@ import (
 	"context"
 	"log"
 	"time"
+	"errors"
+	"strings"
+	"sync"
 
 	storagepb "github.com/HKNain/distributed-storage-system/api/proto"
 
@@ -79,4 +82,48 @@ func RunHeartbeatClient(
 			sendHeartbeat()
 		}
 	}
+}
+
+func RunHeartbeatClients(
+    ctx context.Context,
+    masterAddresses []string,
+    nodeID string,
+    nodeAddress string,
+) error {
+    if len(masterAddresses) == 0 {
+        return errors.New("no master addresses configured")
+    }
+
+    var wg sync.WaitGroup
+
+    for _, address := range masterAddresses {
+        address = strings.TrimSpace(address)
+        if address == "" {
+            continue
+        }
+
+        wg.Add(1)
+
+        go func(masterAddress string) {
+            defer wg.Done()
+
+            if err := RunHeartbeatClient(
+                ctx,
+                masterAddress,
+                nodeID,
+                nodeAddress,
+            ); err != nil {
+                log.Printf(
+                    "Heartbeat client failed for master %s: %v",
+                    masterAddress,
+                    err,
+                )
+            }
+        }(address)
+    }
+
+    <-ctx.Done()
+    wg.Wait()
+
+    return nil
 }
