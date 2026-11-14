@@ -59,9 +59,11 @@ $dataDirBase = if ($config.ContainsKey("MASTER_DATA_DIR_BASE")) {
     $config["MASTER_DATA_DIR_BASE"]
 } else { "data/masters" }
 
-$bootstrap = if ($config.ContainsKey("MASTER_RAFT_BOOTSTRAP")) {
-    $config["MASTER_RAFT_BOOTSTRAP"]
-} else { "true" }
+$bootstrapEnabled = if ($config.ContainsKey("MASTER_RAFT_BOOTSTRAP")) {
+    [bool]::Parse($config["MASTER_RAFT_BOOTSTRAP"])
+} else {
+    $true
+}
 
 if ($count -lt 3) {
     throw "MASTER_NODE_COUNT must be at least 3."
@@ -89,6 +91,11 @@ Write-Host ""
 
 for ($i = 1; $i -le $count; $i++) {
     $nodeID = "master-$i"
+    $nodeBootstrap = "false"
+
+    if ($i -eq 1 -and $bootstrapEnabled) {
+        $nodeBootstrap = "true"
+    }
 
     $httpPort = $httpBasePort + $i - 1
     $grpcPort = $grpcBasePort + $i - 1
@@ -108,7 +115,7 @@ for ($i = 1; $i -le $count; $i++) {
         "`$env:MASTER_RAFT_BIND_ADDRESS = '$($hostAddress):$raftPort'"
         "`$env:MASTER_RAFT_ADVERTISE_ADDRESS = '$($hostAddress):$raftPort'"
         "`$env:MASTER_RAFT_PEERS = '$peers'"
-        "`$env:MASTER_RAFT_BOOTSTRAP = '$bootstrap'"
+        "`$env:MASTER_RAFT_BOOTSTRAP = '$nodeBootstrap'"
         "`$env:MASTER_DATA_DIR = '$dataDir'"
         "Write-Host 'Starting $nodeID' -ForegroundColor Green"
         "go run ./cmd/master"

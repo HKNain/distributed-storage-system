@@ -46,41 +46,80 @@ func NewUserRepositoryWithMetadata(
 
 // CreateUser stores a new user.
 func (r *UserRepository) CreateUser(user models.User) error {
-    if r.metadata == nil {
-        return errors.New("raft metadata service is not configured")
-    }
+	user.Username = strings.ToLower(strings.TrimSpace(user.Username))
+	user.Email = strings.ToLower(strings.TrimSpace(user.Email))
 
-    user.Username = strings.ToLower(strings.TrimSpace(user.Username))
-    user.Email = strings.ToLower(strings.TrimSpace(user.Email))
+	if user.Username == "" || user.Email == "" || user.Password == "" {
+		return errors.New("username, email and password are required")
+	}
 
-    if user.Username == "" || user.Email == "" || user.Password == "" {
-        return errors.New("username, email and password are required")
-    }
+	user.ID = newUserID()
 
-    // Generate identity and timestamps before submitting the Raft command.
-    user.ID = newUserID()
-    now := time.Now().UTC()
-    user.CreatedAt = now
-    user.UpdatedAt = now
+	now := time.Now().UTC()
+	user.CreatedAt = now
+	user.UpdatedAt = now
 
-    payload, err := json.Marshal(user)
-    if err != nil {
-        return fmt.Errorf("marshal user: %w", err)
-    }
+	// Independent local bbolt mode.
+	if r.metadata == nil {
+		return r.DB.Update(func(tx *bolt.Tx) error {
+			bucket, err := tx.CreateBucketIfNotExists(database.UsersBucket)
+			if err != nil {
+				return err
+			}
 
-    err = r.metadata.CreateUser(payload)
-    if err != nil {
-        switch err.Error() {
-        case "USERNAME_EXISTS":
-            return ErrUserExists
-        case "EMAIL_EXISTS":
-            return ErrEmailExists
-        default:
-            return fmt.Errorf("raft user creation failed: %w", err)
-        }
-    }
+			if bucket.Get([]byte(user.Username)) != nil {
+				return ErrUserExists
+			}
 
-    return nil
+			err = bucket.ForEach(func(_, value []byte) error {
+				var existing models.User
+
+				if err := json.Unmarshal(value, &existing); err != nil {
+					return err
+				}
+
+				if strings.EqualFold(existing.Email, user.Email) {
+					return ErrEmailExists
+				}
+
+				if existing.ID == user.ID {
+					return ErrIDExists
+				}
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+
+			data, err := json.Marshal(user)
+			if err != nil {
+				return err
+			}
+
+			return bucket.Put([]byte(user.Username), data)
+		})
+	}
+
+	// Raft-backed mode.
+	payload, err := json.Marshal(user)
+	if err != nil {
+		return fmt.Errorf("marshal user: %w", err)
+	}
+
+	err = r.metadata.CreateUser(payload)
+	if err != nil {
+		switch err.Error() {
+		case "USERNAME_EXISTS":
+			return ErrUserExists
+		case "EMAIL_EXISTS":
+			return ErrEmailExists
+		default:
+			return fmt.Errorf("raft user creation failed: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // GetUserByUsername retrieves a user using username.

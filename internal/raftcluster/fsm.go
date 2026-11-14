@@ -68,7 +68,9 @@ func (f *MetadataFSM) Apply(log *raft.Log) interface{} {
 
 		switch command.Operation {
 		case OperationCreateUser:
-    		err = applyCreateUser(tx, command.Payload)
+    		if err := applyCreateUser(tx, command.Payload); err != nil {
+				return err
+			}
 
 		case OperationMutate:
 			for _, mutation := range command.Mutations {

@@ -59,6 +59,9 @@ func main() {
 
 	// Initialize the Raft FSM using this master's local database.
 	fsm, err := raftcluster.NewMetadataFSM(db)
+	if err != nil {
+		log.Fatal("Failed to initialize Raft FSM:", err)
+	}
 
 	// Parse initial Raft peers.
 	var peers []raftcluster.Peer
@@ -129,8 +132,10 @@ func main() {
 	}
 
 	// Metadata service submits mutations through Raft.
-	metadataService,err := raftcluster.NewMetadataService(raftNode.Raft)
-
+	metadataService, err := raftcluster.NewMetadataService(raftNode.Raft)
+	if err != nil {
+		log.Fatal("Failed to initialize metadata service:", err)
+	}
 	// Repositories.
 	userRepo := repository.NewUserRepositoryWithMetadata(db, metadataService)
 	fileRepo := repository.NewFileRepository(db)
