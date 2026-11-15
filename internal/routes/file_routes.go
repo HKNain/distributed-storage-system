@@ -10,10 +10,11 @@ func FileRoutes(
 	mux *http.ServeMux,
 	fileController *controller.FileController,
 	authMiddleware func(http.Handler) http.Handler,
+	uploadHandler http.Handler,
 ) {
 	mux.Handle(
 		"POST /files/upload",
-		authMiddleware(http.HandlerFunc(fileController.UploadHandler)),
+		authMiddleware(uploadHandler),
 	)
 	mux.Handle(
 		"GET /files/{id}/download",

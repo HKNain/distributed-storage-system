@@ -1,11 +1,14 @@
+
 package raftcluster
 
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/hashicorp/raft"
 )
 
@@ -25,7 +28,140 @@ func NewMetadataService(raftNode *raft.Raft) (*MetadataService, error) {
 	}, nil
 }
 
+// Submit submits a generic bbolt mutation through Raft.
 func (s *MetadataService) Submit(mutations []Mutation) error {
+	return s.applyCommand(&Command{
+		Operation: OperationMutate,
+		Mutations: mutations,
+	})
+}
+
+// CreateUser submits a user creation command through Raft.
+func (s *MetadataService) CreateUser(payload []byte) error {
+	return s.applyCommand(&Command{
+		Operation: OperationCreateUser,
+		Payload:   payload,
+	})
+}
+
+// CreateFile submits new file metadata through Raft.
+func (s *MetadataService) CreateFile(file models.File) error {
+	payload, err := json.Marshal(CreateFilePayload{
+		File: file,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal create-file payload: %w", err)
+	}
+
+	return s.applyCommand(&Command{
+		Operation: OperationCreateFile,
+		Payload:   payload,
+	})
+}
+
+// UpdateFileStatus submits a file status update through Raft.
+func (s *MetadataService) UpdateFileStatus(
+	fileID string,
+	status models.FileStatus,
+	updatedAt time.Time,
+) error {
+	payload, err := json.Marshal(UpdateFileStatusPayload{
+		FileID:    fileID,
+		Status:    status,
+		UpdatedAt: updatedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal file-status payload: %w", err)
+	}
+
+	return s.applyCommand(&Command{
+		Operation: OperationUpdateFileStatus,
+		Payload:   payload,
+	})
+}
+
+// UpdateUploadDetails submits the final upload details through Raft.
+func (s *MetadataService) UpdateUploadDetails(
+	fileID string,
+	checksum string,
+	chunkCount int,
+	updatedAt time.Time,
+) error {
+	payload, err := json.Marshal(UpdateUploadDetailsPayload{
+		FileID:    fileID,
+		Checksum:  checksum,
+		ChunkCount: chunkCount,
+		UpdatedAt: updatedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal upload-details payload: %w", err)
+	}
+
+	return s.applyCommand(&Command{
+		Operation: OperationUpdateUploadDetails,
+		Payload:   payload,
+	})
+}
+
+// CreateChunk submits new chunk metadata through Raft.
+func (s *MetadataService) CreateChunk(chunk models.Chunk) error {
+	payload, err := json.Marshal(CreateChunkPayload{
+		Chunk: chunk,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal create-chunk payload: %w", err)
+	}
+
+	return s.applyCommand(&Command{
+		Operation: OperationCreateChunk,
+		Payload:   payload,
+	})
+}
+
+// UpdateChunkStatus submits a chunk status update through Raft.
+func (s *MetadataService) UpdateChunkStatus(
+	chunkID string,
+	status models.ChunkStatus,
+) error {
+	payload, err := json.Marshal(UpdateChunkStatusPayload{
+		ChunkID: chunkID,
+		Status:  status,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal chunk-status payload: %w", err)
+	}
+
+	return s.applyCommand(&Command{
+		Operation: OperationUpdateChunkStatus,
+		Payload:   payload,
+	})
+}
+
+// UpdateChunkReplica submits a replica status update through Raft.
+func (s *MetadataService) UpdateChunkReplica(
+	chunkID string,
+	nodeID string,
+	status models.ReplicaStatus,
+	updatedAt time.Time,
+) error {
+	payload, err := json.Marshal(UpdateChunkReplicaPayload{
+		ChunkID:   chunkID,
+		NodeID:    nodeID,
+		Status:    status,
+		UpdatedAt: updatedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal replica-update payload: %w", err)
+	}
+
+	return s.applyCommand(&Command{
+		Operation: OperationUpdateChunkReplica,
+		Payload:   payload,
+	})
+}
+
+// applyCommand is the single path for submitting commands to the Raft FSM.
+func (s *MetadataService) applyCommand(command *Command) error {
 	if s.raftNode.State() != raft.Leader {
 		return fmt.Errorf(
 			"this master is not the leader; current leader: %s",
@@ -38,14 +174,11 @@ func (s *MetadataService) Submit(mutations []Mutation) error {
 		return err
 	}
 
-	command := &Command{
-		ID:        commandID,
-		Mutations: mutations,
-	}
+	command.ID = commandID
 
 	data, err := EncodeCommand(command)
 	if err != nil {
-		return err
+		return fmt.Errorf("encode metadata command: %w", err)
 	}
 
 	future := s.raftNode.Apply(data, s.timeout)
@@ -56,7 +189,7 @@ func (s *MetadataService) Submit(mutations []Mutation) error {
 
 	response, ok := future.Response().(ApplyResult)
 	if !ok {
-		return fmt.Errorf("unexpected raft FSM response")
+		return fmt.Errorf("unexpected Raft FSM response")
 	}
 
 	if response.Error != "" {
@@ -74,46 +207,4 @@ func generateCommandID() (string, error) {
 	}
 
 	return hex.EncodeToString(id[:]), nil
-}
-
-func (s *MetadataService) CreateUser(payload []byte) error {
-    if s.raftNode.State() != raft.Leader {
-        return fmt.Errorf(
-            "this master is not the leader; current leader: %s",
-            s.raftNode.Leader(),
-        )
-    }
-
-    commandID, err := generateCommandID()
-    if err != nil {
-        return err
-    }
-
-    command := &Command{
-        ID:        commandID,
-        Operation: OperationCreateUser,
-        Payload:   payload,
-    }
-
-    data, err := EncodeCommand(command)
-    if err != nil {
-        return err
-    }
-
-    future := s.raftNode.Apply(data, s.timeout)
-
-    if err := future.Error(); err != nil {
-        return fmt.Errorf("raft user creation failed: %w", err)
-    }
-
-    response, ok := future.Response().(ApplyResult)
-    if !ok {
-        return fmt.Errorf("unexpected FSM response")
-    }
-
-    if response.Error != "" {
-        return fmt.Errorf("%s", response.Error)
-    }
-
-    return nil
 }

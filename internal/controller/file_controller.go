@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,7 +32,7 @@ type FileController struct {
 	storageManager     *rpc.StorageClientManager
 	replicationManager *rpc.ReplicationManager
 	walWriter          *wal.Writer
-	repairCoordinator *rpc.RepairCoordinator
+	repairCoordinator  *rpc.RepairCoordinator
 }
 
 func NewFileController(
@@ -256,20 +257,100 @@ func (c *FileController) UploadFile(
 			return cause
 		}
 
-		// 5. Store on the primary.
+		// 5. Store on the primary, falling back to assigned replicas when
+		// the primary is unavailable. This mirrors download failover and
+		// keeps the chunk available while the primary is repaired.
+		fallbackReplicaID := ""
 		if err := primaryClient.StoreChunk(
 			ctx,
 			metadata.ID,
 			chunk.Data,
 			metadata.Hash,
 		); err != nil {
-			return failChunk(fmt.Errorf("store primary chunk: %w", err))
+			primaryErr := err
+
+			for _, replica := range replicaNodes {
+				replicaClient, clientErr := c.storageManager.GetClientForNode(
+					replica.NodeID,
+				)
+				if clientErr != nil {
+					log.Printf(
+						"upload fallback unavailable: chunk=%s node=%s: %v",
+						metadata.ID,
+						replica.NodeID,
+						clientErr,
+					)
+					continue
+				}
+
+				if storeErr := replicaClient.StoreChunk(
+					ctx,
+					metadata.ID,
+					chunk.Data,
+					metadata.Hash,
+				); storeErr != nil {
+					log.Printf(
+						"upload fallback failed: chunk=%s node=%s: %v",
+						metadata.ID,
+						replica.NodeID,
+						storeErr,
+					)
+					continue
+				}
+
+				fallbackReplicaID = replica.NodeID
+				if updateErr := c.chunkRepo.UpdateChunkReplica(
+					metadata.ID,
+					models.ChunkReplica{
+						NodeID: replica.NodeID,
+						Status: models.ReplicaStatusStored,
+					},
+				); updateErr != nil {
+					return fmt.Errorf(
+						"update fallback replica metadata: %w",
+						updateErr,
+					)
+				}
+
+				break
+			}
+
+			if fallbackReplicaID == "" {
+				return failChunk(fmt.Errorf(
+					"store chunk on primary and replicas: primary=%w",
+					primaryErr,
+				))
+			}
+
+			if c.repairCoordinator != nil {
+				if repairErr := c.repairCoordinator.ScheduleRepair(
+					metadata,
+					primary.NodeID,
+					"PRIMARY_UNAVAILABLE",
+				); repairErr != nil {
+					log.Printf(
+						"failed to schedule primary repair: chunk=%s node=%s: %v",
+						metadata.ID,
+						primary.NodeID,
+						repairErr,
+					)
+				}
+			}
 		}
 
-		// 6. Store synchronously on the first replica.
+		// 6. Store synchronously on the first replica when possible.
+		// The primary is already durable at this point. A replica failure
+		// remains retryable through the replication worker and must not make
+		// an otherwise successful upload fail.
 		firstReplicaID := replicaNodes[0].NodeID
 
-		if err := c.replicationManager.ReplicateToNode(
+		if fallbackReplicaID == firstReplicaID {
+			log.Printf(
+				"replica write completed during primary fallback: chunk=%s node=%s",
+				metadata.ID,
+				firstReplicaID,
+			)
+		} else if err := c.replicationManager.ReplicateToNode(
 			ctx,
 			firstReplicaID,
 			metadata.ID,
@@ -283,26 +364,28 @@ func (c *FileController) UploadFile(
 					Status: models.ReplicaStatusFailed,
 				},
 			)
-
-			return failChunk(fmt.Errorf(
-				"store synchronous replica %s: %w",
+			log.Printf(
+				"replica write deferred: chunk=%s node=%s: %v",
+				metadata.ID,
 				firstReplicaID,
 				err,
-			))
+			)
+
+		} else {
+			// 7. Persist the successful replica write.
+			if err := c.chunkRepo.UpdateChunkReplica(
+				metadata.ID,
+				models.ChunkReplica{
+					NodeID: firstReplicaID,
+					Status: models.ReplicaStatusStored,
+				},
+			); err != nil {
+				return fmt.Errorf("update synchronous replica metadata: %w", err)
+			}
 		}
 
-		// 7. Persist the successful replica write.
-		if err := c.chunkRepo.UpdateChunkReplica(
-			metadata.ID,
-			models.ChunkReplica{
-				NodeID: firstReplicaID,
-				Status: models.ReplicaStatusStored,
-			},
-		); err != nil {
-			return fmt.Errorf("update synchronous replica metadata: %w", err)
-		}
-
-		// 8. Record quorum success in the WAL.
+		// 8. Record primary-write success in the WAL. Any failed replica
+		// remains pending/failed and is retried asynchronously.
 		if err := c.walWriter.Append(models.Record{
 			Event:      models.EventChunkWriteCommitted,
 			FileID:     file.ID,

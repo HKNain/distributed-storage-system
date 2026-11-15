@@ -4,57 +4,51 @@ package repository
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/HKNain/distributed-storage-system/internal/database"
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/raftcluster"
 	"github.com/google/uuid"
-
 	bolt "go.etcd.io/bbolt"
 )
 
 var ErrFileNotFound = errors.New("file not found")
 
 type FileRepository struct {
-	DB *bolt.DB
+	DB       *bolt.DB
+	metadata *raftcluster.MetadataService
 }
 
-func NewFileRepository(db *bolt.DB) *FileRepository {
-	return &FileRepository{DB: db}
+func NewFileRepository(
+	db *bolt.DB,
+	metadata *raftcluster.MetadataService,
+) *FileRepository {
+	return &FileRepository{
+		DB:       db,
+		metadata: metadata,
+	}
 }
 
-// CreateFile stores new file metadata.
+// CreateFile submits new file metadata through Raft.
 func (repo *FileRepository) CreateFile(file models.File) (models.File, error) {
-	err := repo.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(database.FilesBucket)
-		if bucket == nil {
-			return errors.New("files bucket not found")
-		}
+	if repo.metadata == nil {
+		return file, errors.New("metadata service is required")
+	}
 
-		// Generate a unique file ID.
-		for {
-			file.ID = uuid.NewString()
+	file.ID = uuid.NewString()
 
-			if bucket.Get([]byte(file.ID)) == nil {
-				break
-			}
-		}
+	now := time.Now().UTC()
+	file.CreatedAt = now
+	file.UpdatedAt = now
+	file.Status = models.FileStatusUploading
 
-		now := time.Now().UTC()
+	if err := repo.metadata.CreateFile(file); err != nil {
+		return file, fmt.Errorf("create file metadata: %w", err)
+	}
 
-		file.CreatedAt = now
-		file.UpdatedAt = now
-		file.Status = models.FileStatusUploading
-
-		data, err := json.Marshal(file)
-		if err != nil {
-			return err
-		}
-
-		return bucket.Put([]byte(file.ID), data)
-	})
-
-	return file, err
+	return file, nil
 }
 
 // GetFileByID retrieves file metadata using its ID.
@@ -106,7 +100,7 @@ func (repo *FileRepository) ListFilesByUser(userID string) ([]models.File, error
 	return files, err
 }
 
-// UpdateFileStatus updates the status of a file.
+// UpdateFileStatus submits a file status update through Raft.
 func (repo *FileRepository) UpdateFileStatus(
 	fileID string,
 	status models.FileStatus,
@@ -115,33 +109,15 @@ func (repo *FileRepository) UpdateFileStatus(
 		return errors.New("invalid file status")
 	}
 
-	return repo.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(database.FilesBucket)
-		if bucket == nil {
-			return errors.New("files bucket not found")
-		}
+	if repo.metadata == nil {
+		return errors.New("metadata service is required")
+	}
 
-		data := bucket.Get([]byte(fileID))
-		if data == nil {
-			return ErrFileNotFound
-		}
-
-		var file models.File
-
-		if err := json.Unmarshal(data, &file); err != nil {
-			return err
-		}
-
-		file.Status = status
-		file.UpdatedAt = time.Now().UTC()
-
-		updatedData, err := json.Marshal(file)
-		if err != nil {
-			return err
-		}
-
-		return bucket.Put([]byte(fileID), updatedData)
-	})
+	return repo.metadata.UpdateFileStatus(
+		fileID,
+		status,
+		time.Now().UTC(),
+	)
 }
 
 func isValidFileStatus(status models.FileStatus) bool {
@@ -155,34 +131,20 @@ func isValidFileStatus(status models.FileStatus) bool {
 	}
 }
 
-func (r *FileRepository) UpdateUploadDetails(
+// UpdateUploadDetails submits final upload details through Raft.
+func (repo *FileRepository) UpdateUploadDetails(
 	fileID string,
 	checksum string,
 	chunkCount int,
 ) error {
-	return r.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(database.FilesBucket)
+	if repo.metadata == nil {
+		return errors.New("metadata service is required")
+	}
 
-		data := bucket.Get([]byte(fileID))
-		if data == nil {
-			return ErrFileNotFound
-		}
-
-		var file models.File
-		if err := json.Unmarshal(data, &file); err != nil {
-			return err
-		}
-
-		file.Checksum = checksum
-		file.ChunkCount = chunkCount
-		file.UpdatedAt = time.Now().UTC()
-
-		updated, err := json.Marshal(file)
-		if err != nil {
-			return err
-		}
-
-		return bucket.Put([]byte(fileID), updated)
-	})
+	return repo.metadata.UpdateUploadDetails(
+		fileID,
+		checksum,
+		chunkCount,
+		time.Now().UTC(),
+	)
 }
-

@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -67,6 +66,18 @@ func main() {
 	var peers []raftcluster.Peer
 
 	peerConfig := os.Getenv("MASTER_RAFT_PEERS")
+	httpPeerConfig := os.Getenv("MASTER_HTTP_PEERS")
+	httpPeers := make(map[string]string)
+
+	for _, entry := range strings.Split(httpPeerConfig, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+		if len(parts) == 2 &&
+			parts[0] != "" &&
+			parts[1] != "" {
+			httpPeers[parts[0]] = parts[1]
+		}
+	}
+
 	for _, entry := range strings.Split(peerConfig, ",") {
 		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -85,12 +96,12 @@ func main() {
 	}
 
 	raftConfig := raftcluster.Config{
-		NodeID:          os.Getenv("MASTER_NODE_ID"),
-		BindAddress:     os.Getenv("MASTER_RAFT_BIND_ADDRESS"),
+		NodeID:           os.Getenv("MASTER_NODE_ID"),
+		BindAddress:      os.Getenv("MASTER_RAFT_BIND_ADDRESS"),
 		AdvertiseAddress: os.Getenv("MASTER_RAFT_ADVERTISE_ADDRESS"),
-		DataDir:         filepath.Join(dataDir, "raft"),
-		Bootstrap:       bootstrap,
-		Peers:           peers,
+		DataDir:          filepath.Join(dataDir, "raft"),
+		Bootstrap:        bootstrap,
+		Peers:            peers,
 	}
 
 	if raftConfig.NodeID == "" {
@@ -138,8 +149,8 @@ func main() {
 	}
 	// Repositories.
 	userRepo := repository.NewUserRepositoryWithMetadata(db, metadataService)
-	fileRepo := repository.NewFileRepository(db)
-	chunkRepo := repository.NewChunkRepository(db)
+	fileRepo := repository.NewFileRepository(db, metadataService)
+	chunkRepo := repository.NewChunkRepository(db, metadataService)
 
 	// Storage node registry.
 	nodeRegistry := rpc.NewNodeRegistry()
@@ -233,12 +244,17 @@ func main() {
 	}
 
 	authMiddleware := middleware.AuthMiddleware(jwtSecret)
+	uploadHandler := middleware.ForwardToLeader(
+		raftNode.Raft,
+		httpPeersByRaftAddress(peerConfig, httpPeers),
+		http.HandlerFunc(fileController.UploadHandler),
+	)
 
 	// Routes.
 	mux := http.NewServeMux()
 
 	routes.AuthRoutes(mux, authController)
-	routes.FileRoutes(mux, fileController, authMiddleware)
+	routes.FileRoutes(mux, fileController, authMiddleware, uploadHandler)
 
 	// Middleware.
 	handler := middleware.LoggingMiddleware(mux)
@@ -285,8 +301,6 @@ func main() {
 		defer close(repairDone)
 		repairWorker.Run(repairCtx, 10*time.Second)
 	}()
-
-	
 
 	// HTTP server.
 	httpServer := &http.Server{
@@ -356,4 +370,28 @@ func main() {
 	masterGRPC.GracefulStop()
 
 	log.Println("Master server stopped")
+}
+
+func httpPeersByRaftAddress(
+	raftPeerConfig string,
+	httpPeersByID map[string]string,
+) map[string]string {
+	result := make(map[string]string)
+
+	for _, entry := range strings.Split(raftPeerConfig, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		nodeID := strings.TrimSpace(parts[0])
+		raftAddress := strings.TrimSpace(parts[1])
+		httpAddress := strings.TrimSpace(httpPeersByID[nodeID])
+
+		if nodeID != "" && raftAddress != "" && httpAddress != "" {
+			result[raftAddress] = httpAddress
+		}
+	}
+
+	return result
 }

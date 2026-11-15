@@ -6,9 +6,12 @@ import (
 	"errors"
 	"sort"
 	"time"
+	"strings"
+	"fmt"
 
 	"github.com/HKNain/distributed-storage-system/internal/database"
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/raftcluster"
 	"github.com/google/uuid"
 
 	bolt "go.etcd.io/bbolt"
@@ -20,16 +23,25 @@ var (
 )
 
 type ChunkRepository struct {
-	DB *bolt.DB
+	DB       *bolt.DB
+	metadata *raftcluster.MetadataService
 }
 
-func NewChunkRepository(db *bolt.DB) *ChunkRepository {
-	return &ChunkRepository{DB: db}
+func NewChunkRepository(
+	db *bolt.DB,
+	metadata *raftcluster.MetadataService,
+) *ChunkRepository {
+	return &ChunkRepository{
+		DB:       db,
+		metadata: metadata,
+	}
 }
 
 // CreateChunk stores chunk metadata.
 // If an ID is provided, it is preserved. Otherwise, a new UUID is generated.
-func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, error) {
+func (repo *ChunkRepository) CreateChunk(
+	chunk models.Chunk,
+) (models.Chunk, error) {
 	if chunk.FileID == "" {
 		return chunk, errors.New("file ID is required")
 	}
@@ -46,76 +58,31 @@ func (repo *ChunkRepository) CreateChunk(chunk models.Chunk) (models.Chunk, erro
 		return chunk, errors.New("invalid chunk status")
 	}
 
-	err := repo.DB.Update(func(tx *bolt.Tx) error {
-		filesBucket := tx.Bucket(database.FilesBucket)
-		chunksBucket := tx.Bucket(database.ChunksBucket)
+	if repo.metadata == nil {
+		return chunk, errors.New("metadata service is required")
+	}
 
-		if filesBucket == nil || chunksBucket == nil {
-			return errors.New("required database bucket not found")
+	// Generate these before submitting the command.
+	// Every Raft FSM will receive the same values.
+	if chunk.ID == "" {
+		chunk.ID = uuid.NewString()
+	}
+
+	if chunk.CreatedAt.IsZero() {
+		chunk.CreatedAt = time.Now().UTC()
+	}
+
+	if err := repo.metadata.CreateChunk(chunk); err != nil {
+		// Preserve the existing sentinel error for callers
+		// that check for duplicate chunk indexes.
+		if strings.Contains(err.Error(), ErrChunkIndexUsed.Error()) {
+			return chunk, ErrChunkIndexUsed
 		}
 
-		// Verify parent file exists.
-		fileData := filesBucket.Get([]byte(chunk.FileID))
-		if fileData == nil {
-			return ErrFileNotFound
-		}
+		return chunk, fmt.Errorf("create chunk metadata: %w", err)
+	}
 
-		var file models.File
-		if err := json.Unmarshal(fileData, &file); err != nil {
-			return err
-		}
-
-		if file.Status != models.FileStatusUploading {
-			return errors.New("file is not accepting chunks")
-		}
-
-		// Ensure this file/index combination is unique.
-		err := chunksBucket.ForEach(func(_, value []byte) error {
-			var existing models.Chunk
-
-			if err := json.Unmarshal(value, &existing); err != nil {
-				return err
-			}
-
-			if existing.FileID == chunk.FileID &&
-				existing.Index == chunk.Index {
-				return ErrChunkIndexUsed
-			}
-
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		// Preserve a caller-provided ID (needed for WAL recovery).
-		if chunk.ID != "" {
-			if chunksBucket.Get([]byte(chunk.ID)) != nil {
-				return errors.New("chunk ID already exists")
-			}
-		} else {
-			for {
-				chunk.ID = uuid.NewString()
-
-				if chunksBucket.Get([]byte(chunk.ID)) == nil {
-					break
-				}
-			}
-		}
-
-		if chunk.CreatedAt.IsZero() {
-			chunk.CreatedAt = time.Now().UTC()
-		}
-
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			return err
-		}
-
-		return chunksBucket.Put([]byte(chunk.ID), data)
-	})
-
-	return chunk, err
+	return chunk, nil
 }
 
 // GetChunkByID retrieves metadata using the chunk ID.
@@ -230,32 +197,11 @@ func (repo *ChunkRepository) UpdateChunkStatus(
 		return errors.New("invalid chunk status")
 	}
 
-	return repo.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(database.ChunksBucket)
-		if bucket == nil {
-			return errors.New("chunks bucket not found")
-		}
+	if repo.metadata == nil {
+		return errors.New("metadata service is required")
+	}
 
-		data := bucket.Get([]byte(chunkID))
-		if data == nil {
-			return ErrChunkNotFound
-		}
-
-		var chunk models.Chunk
-
-		if err := json.Unmarshal(data, &chunk); err != nil {
-			return err
-		}
-
-		chunk.Status = status
-
-		updatedData, err := json.Marshal(chunk)
-		if err != nil {
-			return err
-		}
-
-		return bucket.Put([]byte(chunkID), updatedData)
-	})
+	return repo.metadata.UpdateChunkStatus(chunkID, status)
 }
 
 func isValidChunkStatus(status models.ChunkStatus) bool {
@@ -272,57 +218,29 @@ func isValidChunkStatus(status models.ChunkStatus) bool {
 
 // UpdateChunkReplica updates the status of a replica identified by its node ID.
 func (repo *ChunkRepository) UpdateChunkReplica(
-    chunkID string,
-    replica models.ChunkReplica,
+	chunkID string,
+	replica models.ChunkReplica,
 ) error {
-    if chunkID == "" || replica.NodeID == "" {
-        return errors.New("chunk ID and replica node ID are required")
-    }
+	if chunkID == "" || replica.NodeID == "" {
+		return errors.New("chunk ID and replica node ID are required")
+	}
 
-    if replica.Status != models.ReplicaStatusPending &&
-        replica.Status != models.ReplicaStatusStored &&
-        replica.Status != models.ReplicaStatusFailed {
-        return errors.New("invalid replica status")
-    }
+	if replica.Status != models.ReplicaStatusPending &&
+		replica.Status != models.ReplicaStatusStored &&
+		replica.Status != models.ReplicaStatusFailed {
+		return errors.New("invalid replica status")
+	}
 
-    return repo.DB.Update(func(tx *bolt.Tx) error {
-        bucket := tx.Bucket(database.ChunksBucket)
-        if bucket == nil {
-            return errors.New("chunks bucket not found")
-        }
+	if repo.metadata == nil {
+		return errors.New("metadata service is required")
+	}
 
-        data := bucket.Get([]byte(chunkID))
-        if data == nil {
-            return ErrChunkNotFound
-        }
-
-        var chunk models.Chunk
-        if err := json.Unmarshal(data, &chunk); err != nil {
-            return err
-        }
-
-        found := false
-
-        for i := range chunk.Replicas {
-            if chunk.Replicas[i].NodeID == replica.NodeID {
-                chunk.Replicas[i].Status = replica.Status
-                chunk.Replicas[i].UpdatedAt = time.Now().UTC()
-                found = true
-                break
-            }
-        }
-
-        if !found {
-            return errors.New("replica node not found in chunk metadata")
-        }
-
-        updatedData, err := json.Marshal(chunk)
-        if err != nil {
-            return err
-        }
-
-        return bucket.Put([]byte(chunkID), updatedData)
-    })
+	return repo.metadata.UpdateChunkReplica(
+		chunkID,
+		replica.NodeID,
+		replica.Status,
+		time.Now().UTC(),
+	)
 }
 
 // GetChunksWithPendingReplicas returns stored chunks that still have

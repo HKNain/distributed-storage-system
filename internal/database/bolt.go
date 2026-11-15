@@ -25,16 +25,19 @@ func OpenDB(dbPath string) (*bolt.DB, error) {
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
-		// Create the users bucket if it doesn't exist.
-		_, err := tx.CreateBucketIfNotExists(UsersBucket)
+		if _, err := tx.CreateBucketIfNotExists(UsersBucket); err != nil {
+			return err
+		}
 
-		// Create the files bucket if it doesn't exist.
-		_, err = tx.CreateBucketIfNotExists(FilesBucket)
+		if _, err := tx.CreateBucketIfNotExists(FilesBucket); err != nil {
+			return err
+		}
 
-		// Create the chunks bucket if it doesn't exist.
-		_, err = tx.CreateBucketIfNotExists(ChunksBucket)
-		
-		return err
+		if _, err := tx.CreateBucketIfNotExists(ChunksBucket); err != nil {
+			return err
+		}
+
+		return nil
 	})
 
 	if err != nil {

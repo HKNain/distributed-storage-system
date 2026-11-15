@@ -84,6 +84,14 @@ $peers = @(
     }
 ) -join ","
 
+$httpPeers = @(
+    for ($i = 1; $i -le $count; $i++) {
+        $id = "master-$i"
+        $httpPort = $httpBasePort + $i - 1
+        "$id=$($hostAddress):$httpPort"
+    }
+) -join ","
+
 Write-Host ""
 Write-Host "Starting $count master nodes..." -ForegroundColor Cyan
 Write-Host "Raft peers: $peers"
@@ -115,6 +123,7 @@ for ($i = 1; $i -le $count; $i++) {
         "`$env:MASTER_RAFT_BIND_ADDRESS = '$($hostAddress):$raftPort'"
         "`$env:MASTER_RAFT_ADVERTISE_ADDRESS = '$($hostAddress):$raftPort'"
         "`$env:MASTER_RAFT_PEERS = '$peers'"
+        "`$env:MASTER_HTTP_PEERS = '$httpPeers'"
         "`$env:MASTER_RAFT_BOOTSTRAP = '$nodeBootstrap'"
         "`$env:MASTER_DATA_DIR = '$dataDir'"
         "Write-Host 'Starting $nodeID' -ForegroundColor Green"

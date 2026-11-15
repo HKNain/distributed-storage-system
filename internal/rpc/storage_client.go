@@ -1,4 +1,3 @@
-
 package rpc
 
 import (
@@ -11,6 +10,11 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	storageRPCDeadline  = 60 * time.Second
+	maxChunkMessageSize = 8 * 1024 * 1024
 )
 
 type StorageClient struct {
@@ -27,8 +31,8 @@ func NewStorageClient(address string) (*StorageClient, error) {
 		address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(5*1024*1024),
-			grpc.MaxCallSendMsgSize(5*1024*1024),
+			grpc.MaxCallRecvMsgSize(maxChunkMessageSize),
+			grpc.MaxCallSendMsgSize(maxChunkMessageSize),
 		),
 	)
 	if err != nil {
@@ -41,14 +45,13 @@ func NewStorageClient(address string) (*StorageClient, error) {
 	}, nil
 }
 
-
 func (s *StorageClient) StoreChunk(
 	ctx context.Context,
 	chunkID string,
 	data []byte,
 	checksum string,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, storageRPCDeadline)
 	defer cancel()
 
 	resp, err := s.client.StoreChunk(ctx, &storagepb.StoreChunkRequest{
@@ -67,12 +70,11 @@ func (s *StorageClient) StoreChunk(
 	return nil
 }
 
-
 func (s *StorageClient) GetChunk(
 	ctx context.Context,
 	chunkID string,
 ) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, storageRPCDeadline)
 	defer cancel()
 
 	resp, err := s.client.GetChunk(ctx, &storagepb.GetChunkRequest{
@@ -89,7 +91,7 @@ func (s *StorageClient) DeleteChunk(
 	ctx context.Context,
 	chunkID string,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, storageRPCDeadline)
 	defer cancel()
 
 	resp, err := s.client.DeleteChunk(ctx, &storagepb.DeleteChunkRequest{
