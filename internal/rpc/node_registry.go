@@ -1,13 +1,14 @@
-
 package rpc
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 type NodeState string
@@ -42,6 +43,7 @@ func (r *NodeRegistry) RecordHeartbeat(nodeID, address string) bool {
 	address = strings.TrimSpace(address)
 
 	if nodeID == "" || address == "" {
+		logger.LogCluster("event=heartbeat result=rejected reason=missing_node_identity")
 		return false
 	}
 
@@ -53,6 +55,7 @@ func (r *NodeRegistry) RecordHeartbeat(nodeID, address string) bool {
 	if !exists {
 		node = &StorageNodeInfo{NodeID: nodeID}
 		r.nodes[nodeID] = node
+		logger.LogCluster(fmt.Sprintf("event=node_registration node=%q address=%q", nodeID, address))
 	}
 
 	node.Address = address
@@ -161,18 +164,13 @@ func (r *NodeRegistry) RunMonitor(ctx context.Context) {
 			for _, node := range r.Snapshot() {
 				switch node.State {
 				case NodeActive:
-					log.Printf("Storage Node %s: ACTIVE", node.NodeID)
+					logger.LogCluster(fmt.Sprintf("event=node_state node=%q state=ACTIVE", node.NodeID))
 
 				case NodeMissed:
-					log.Printf(
-						"Storage Node %s: MISSED (%d/%d)",
-						node.NodeID,
-						node.MissedBeats,
-						FailureThresholdFromEnv(),
-					)
+					logger.LogCluster(fmt.Sprintf("event=node_state node=%q state=MISSED missed=%d threshold=%d", node.NodeID, node.MissedBeats, FailureThresholdFromEnv()))
 
 				case NodeDead:
-					log.Printf("Storage Node %s: DEAD", node.NodeID)
+					logger.LogCluster(fmt.Sprintf("event=node_state node=%q state=DEAD", node.NodeID))
 				}
 			}
 		}

@@ -1,9 +1,10 @@
 package middleware
 
 import (
-	"log"
 	"net/http"
 	"time"
+
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 type responseRecorder struct {
@@ -29,12 +30,12 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 
 		duration := time.Since(start)
 
-		log.Printf(
-			"%s %s %d %s",
-			r.Method,
-			r.URL.Path,
-			recorder.statusCode,
-			duration,
-		)
+		logger.LogAPI(logger.APIEvent{
+			Method:     r.Method,
+			Path:       r.URL.RequestURI(),
+			StatusCode: recorder.statusCode,
+			Duration:   duration,
+			RequestID:  r.Header.Get("X-Request-ID"),
+		})
 	})
 }

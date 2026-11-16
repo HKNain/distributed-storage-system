@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 type Writer struct {
@@ -25,12 +26,14 @@ type Writer struct {
 // OpenWriter creates or opens an existing WAL file.
 func OpenWriter(path string) (*Writer, error) {
 	if path == "" {
+		logger.LogRecovery("event=wal_open result=failed reason=empty_path")
 		return nil, errors.New("WAL path cannot be empty")
 	}
 
 	dir := filepath.Dir(path)
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
+		logger.LogError(fmt.Errorf("create WAL directory: %w", err))
 		return nil, fmt.Errorf("create WAL directory: %w", err)
 	}
 
@@ -40,6 +43,7 @@ func OpenWriter(path string) (*Writer, error) {
 		0644,
 	)
 	if err != nil {
+		logger.LogError(fmt.Errorf("open WAL file %q: %w", path, err))
 		return nil, fmt.Errorf("open WAL file: %w", err)
 	}
 
@@ -49,10 +53,12 @@ func OpenWriter(path string) (*Writer, error) {
 
 	// Recover the last valid sequence number.
 	if err := writer.recoverSequence(); err != nil {
+		logger.LogError(fmt.Errorf("recover WAL sequence from %q: %w", path, err))
 		file.Close()
 		return nil, fmt.Errorf("recover WAL sequence: %w", err)
 	}
 
+	logger.LogRecovery(fmt.Sprintf("event=wal_open path=%q sequence=%d result=success", path, writer.sequence))
 	return writer, nil
 }
 
@@ -107,6 +113,7 @@ func (w *Writer) Append(record models.Record) error {
 
 	w.sequence = record.Sequence
 
+	logger.LogRecovery(fmt.Sprintf("event=wal_append file=%q sequence=%d operation=%q", w.file.Name(), record.Sequence, record.Event))
 	return nil
 }
 
@@ -182,6 +189,7 @@ func (w *Writer) recoverSequence() error {
 
 	w.sequence = lastSequence
 
+	logger.LogRecovery(fmt.Sprintf("event=wal_sequence file=%q sequence=%d result=success", w.file.Name(), lastSequence))
 	return nil
 }
 

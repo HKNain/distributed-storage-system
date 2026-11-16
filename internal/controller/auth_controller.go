@@ -3,7 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/HKNain/distributed-storage-system/internal/repository"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
@@ -35,6 +36,7 @@ func (ac *AuthController) SignupHandler(w http.ResponseWriter, r *http.Request) 
 
 	err := json.NewDecoder(r.Body).Decode(&input)
 	if err != nil {
+		logger.LogAuth(logger.AuthEvent{Action: "signup", Success: false, StatusCode: http.StatusBadRequest, Reason: "invalid JSON body"})
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -43,16 +45,19 @@ func (ac *AuthController) SignupHandler(w http.ResponseWriter, r *http.Request) 
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 
 	if input.Username == "" || input.Email == "" || input.Password == "" {
+		logger.LogAuth(logger.AuthEvent{Action: "signup", Identifier: input.Username, Success: false, StatusCode: http.StatusBadRequest, Reason: "required fields missing"})
 		http.Error(w, "All fields are required", http.StatusBadRequest)
 		return
 	}
 
 	if len(input.Password) < 8 {
+		logger.LogAuth(logger.AuthEvent{Action: "signup", Identifier: input.Username, Success: false, StatusCode: http.StatusBadRequest, Reason: "password too short"})
 		http.Error(w, "Password must contain at least 8 characters", http.StatusBadRequest)
 		return
 	}
 
 	if len(ac.JWTSecret) == 0 {
+		logger.LogError(errors.New("JWT secret is not configured"))
 		http.Error(w, "Server configuration error", http.StatusInternalServerError)
 		return
 	}
@@ -63,6 +68,7 @@ func (ac *AuthController) SignupHandler(w http.ResponseWriter, r *http.Request) 
 		bcrypt.DefaultCost,
 	)
 	if err != nil {
+		logger.LogError(fmt.Errorf("hash password for user %q: %w", input.Username, err))
 		http.Error(w, "Could not process password", http.StatusInternalServerError)
 		return
 	}
@@ -77,16 +83,19 @@ func (ac *AuthController) SignupHandler(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 
 		if errors.Is(err, repository.ErrUserExists) {
+			logger.LogAuth(logger.AuthEvent{Action: "signup", Identifier: input.Username, Success: false, StatusCode: http.StatusConflict, Reason: "username already exists"})
 			http.Error(w, "Username already exists", http.StatusConflict)
 			return
 		}
 
 		if errors.Is(err, repository.ErrEmailExists) {
+			logger.LogAuth(logger.AuthEvent{Action: "signup", Identifier: input.Username, Success: false, StatusCode: http.StatusConflict, Reason: "email already registered"})
 			http.Error(w, "Email already registered", http.StatusConflict)
 			return
 		}
 
 		http.Error(w, "Could not create user", http.StatusInternalServerError)
+		logger.LogError(fmt.Errorf("create user %q: %w", input.Username, err))
 		return
 	}
 
@@ -96,6 +105,7 @@ func (ac *AuthController) SignupHandler(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": "User registered successfully",
 	})
+	logger.LogAuth(logger.AuthEvent{Action: "signup", Identifier: input.Username, Success: true, StatusCode: http.StatusCreated})
 }
 
 // LoginHandler authenticates an existing user.
@@ -104,6 +114,7 @@ func (ac *AuthController) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	var input models.LoginRequest
 	err := json.NewDecoder(r.Body).Decode(&input)
 	if err != nil {
+		logger.LogAuth(logger.AuthEvent{Action: "login", Success: false, StatusCode: http.StatusBadRequest, Reason: "invalid JSON body"})
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -111,17 +122,20 @@ func (ac *AuthController) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	input.Username = strings.ToLower(strings.TrimSpace(input.Username))
 
 	if input.Username == "" || input.Password == "" {
+		logger.LogAuth(logger.AuthEvent{Action: "login", Identifier: input.Username, Success: false, StatusCode: http.StatusBadRequest, Reason: "required fields missing"})
 		http.Error(w, "Username and password are required", http.StatusBadRequest)
 		return
 	}
 
 	if len(ac.JWTSecret) == 0 {
+		logger.LogError(errors.New("JWT secret is not configured"))
 		http.Error(w, "Server configuration error", http.StatusInternalServerError)
 		return
 	}
 	// Find user.
 	user, err := ac.UserRepo.GetUserByUsername(input.Username)
 	if err != nil {
+		logger.LogAuth(logger.AuthEvent{Action: "login", Identifier: input.Username, Success: false, StatusCode: http.StatusUnauthorized, Reason: "invalid username or password"})
 		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
 	}
@@ -131,7 +145,7 @@ func (ac *AuthController) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		[]byte(input.Password),
 	)
 	if err != nil {
-		log.Println("passrod compare failed")
+		logger.LogAuth(logger.AuthEvent{Action: "login", Identifier: input.Username, Success: false, StatusCode: http.StatusUnauthorized, Reason: "password mismatch"})
 		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
 	}
@@ -146,14 +160,15 @@ func (ac *AuthController) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(ac.JWTSecret)
 	if err != nil {
+		logger.LogError(fmt.Errorf("generate token for user %q: %w", input.Username, err))
 		http.Error(w, "Could not generate token", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	log.Println("Token generated:", tokenString)
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": "Login successful",
 		"token":   tokenString,
 	})
+	logger.LogAuth(logger.AuthEvent{Action: "login", Identifier: input.Username, Success: true, StatusCode: http.StatusOK})
 }

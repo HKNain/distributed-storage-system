@@ -2,18 +2,20 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"syscall"
 	"strings"
+	"syscall"
 
 	"github.com/joho/godotenv"
 
 	storagepb "github.com/HKNain/distributed-storage-system/api/proto"
 	"github.com/HKNain/distributed-storage-system/internal/rpc"
 	"github.com/HKNain/distributed-storage-system/internal/storage"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 
 	"google.golang.org/grpc"
 )
@@ -24,6 +26,11 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Could not load .env: %v", err)
 	}
+
+	if err := logger.Init(); err != nil {
+		log.Fatalf("failed to initialize logger: %v", err)
+	}
+	defer logger.Close()
 
 	port := os.Getenv("STORAGE_NODE_PORT")
 	if port == "" {
@@ -60,12 +67,14 @@ func main() {
 	// Initialize disk storage.
 	diskStorage, err := storage.NewDiskStorage(storageDir)
 	if err != nil {
+		logger.LogError(err)
 		log.Fatalf("failed to initialize disk storage: %v", err)
 	}
 
 	// Create TCP listener.
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
+		logger.LogError(err)
 		log.Fatalf("failed to listen on port %s: %v", port, err)
 	}
 	defer listener.Close()
@@ -102,6 +111,7 @@ func main() {
 	log.Printf("Storage directory: %s", storageDir)
 	log.Printf("Master addresses: %v", masterAddresses)
 	log.Printf("Heartbeat interval: %s", rpc.HeartbeatIntervalFromEnv())
+	logger.LogCluster(fmt.Sprintf("node=%q state=STARTED address=%q storage_dir=%q", nodeID, nodeAddress, storageDir))
 
 	// Start heartbeat client.
 	go func() {
@@ -111,12 +121,14 @@ func main() {
 			nodeID,
 			nodeAddress,
 		); err != nil {
+			logger.LogError(fmt.Errorf("heartbeat clients for node %s: %w", nodeID, err))
 			log.Printf("Heartbeat clients error for %s: %v", nodeID, err)
 		}
 	}()
 
 	select {
 	case <-ctx.Done():
+		logger.LogCluster(fmt.Sprintf("node=%q state=SHUTTING_DOWN", nodeID))
 		log.Printf("Shutting down storage node %s...", nodeID)
 		grpcServer.GracefulStop()
 

@@ -1,4 +1,3 @@
-
 package raftcluster
 
 import (
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 	"github.com/hashicorp/raft"
 )
 
@@ -88,10 +88,10 @@ func (s *MetadataService) UpdateUploadDetails(
 	updatedAt time.Time,
 ) error {
 	payload, err := json.Marshal(UpdateUploadDetailsPayload{
-		FileID:    fileID,
-		Checksum:  checksum,
+		FileID:     fileID,
+		Checksum:   checksum,
 		ChunkCount: chunkCount,
-		UpdatedAt: updatedAt,
+		UpdatedAt:  updatedAt,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal upload-details payload: %w", err)
@@ -163,6 +163,7 @@ func (s *MetadataService) UpdateChunkReplica(
 // applyCommand is the single path for submitting commands to the Raft FSM.
 func (s *MetadataService) applyCommand(command *Command) error {
 	if s.raftNode.State() != raft.Leader {
+		logger.LogRaft(fmt.Sprintf("event=command operation=%q result=rejected reason=not_leader leader=%q", command.Operation, s.raftNode.Leader()))
 		return fmt.Errorf(
 			"this master is not the leader; current leader: %s",
 			s.raftNode.Leader(),
@@ -175,6 +176,7 @@ func (s *MetadataService) applyCommand(command *Command) error {
 	}
 
 	command.ID = commandID
+	logger.LogRaft(fmt.Sprintf("event=command operation=%q id=%q result=submitted", command.Operation, command.ID))
 
 	data, err := EncodeCommand(command)
 	if err != nil {
@@ -184,6 +186,7 @@ func (s *MetadataService) applyCommand(command *Command) error {
 	future := s.raftNode.Apply(data, s.timeout)
 
 	if err := future.Error(); err != nil {
+		logger.LogError(fmt.Errorf("raft command %s failed: %w", command.ID, err))
 		return fmt.Errorf("raft command failed: %w", err)
 	}
 
@@ -193,9 +196,11 @@ func (s *MetadataService) applyCommand(command *Command) error {
 	}
 
 	if response.Error != "" {
+		logger.LogRaft(fmt.Sprintf("event=command operation=%q id=%q result=failed error=%q", command.Operation, command.ID, response.Error))
 		return fmt.Errorf("metadata command failed: %s", response.Error)
 	}
 
+	logger.LogRaft(fmt.Sprintf("event=command operation=%q id=%q result=committed", command.Operation, command.ID))
 	return nil
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 var (
@@ -53,6 +55,7 @@ func (r *ReplicationManager) SelectReplicaNodes(
 
 	// We need the primary plus the requested number of replicas.
 	if activeCount < replicaCount+1 {
+		logger.LogReplication(fmt.Sprintf("event=replica_selection primary=%q requested=%d active=%d result=insufficient", primaryNodeID, replicaCount, activeCount))
 		return nil, fmt.Errorf(
 			"%w: need %d active nodes, found %d",
 			ErrInsufficientStorageNodes,
@@ -93,6 +96,7 @@ func (r *ReplicationManager) SelectReplicaNodes(
 	}
 
 	if len(selected) != replicaCount {
+		logger.LogReplication(fmt.Sprintf("event=replica_selection primary=%q requested=%d selected=%d result=failed", primaryNodeID, replicaCount, len(selected)))
 		return nil, fmt.Errorf(
 			"%w: selected %d of %d replicas",
 			ErrInsufficientStorageNodes,
@@ -101,6 +105,7 @@ func (r *ReplicationManager) SelectReplicaNodes(
 		)
 	}
 
+	logger.LogReplication(fmt.Sprintf("event=replica_selection primary=%q replicas=%d result=success", primaryNodeID, len(selected)))
 	return selected, nil
 }
 
@@ -135,6 +140,7 @@ func (r *ReplicationManager) ReplicateToNode(
 	}
 
 	if err := client.StoreChunk(ctx, chunkID, data, checksum); err != nil {
+		logger.LogReplication(fmt.Sprintf("event=replica_write node=%q chunk=%q result=failed error=%q", nodeID, chunkID, err))
 		return fmt.Errorf(
 			"store chunk %q on replica node %q: %w",
 			chunkID,
@@ -143,5 +149,6 @@ func (r *ReplicationManager) ReplicateToNode(
 		)
 	}
 
+	logger.LogReplication(fmt.Sprintf("event=replica_write node=%q chunk=%q bytes=%d result=success", nodeID, chunkID, len(data)))
 	return nil
 }

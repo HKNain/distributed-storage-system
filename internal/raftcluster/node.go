@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
 )
@@ -33,6 +34,7 @@ type Node struct {
 }
 
 func Start(cfg Config, fsm raft.FSM) (*Node, error) {
+	logger.LogRaft(fmt.Sprintf("event=start node=%q bind=%q advertise=%q bootstrap=%t", cfg.NodeID, cfg.BindAddress, cfg.AdvertiseAddress, cfg.Bootstrap))
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("raft node ID is required")
 	}
@@ -141,8 +143,8 @@ func Start(cfg Config, fsm raft.FSM) (*Node, error) {
 
 		for _, peer := range cfg.Peers {
 			servers = append(servers, raft.Server{
-				ID:      raft.ServerID(peer.ID),
-				Address: raft.ServerAddress(peer.Address),
+				ID:       raft.ServerID(peer.ID),
+				Address:  raft.ServerAddress(peer.Address),
 				Suffrage: raft.Voter,
 			})
 		}
@@ -157,11 +159,14 @@ func Start(cfg Config, fsm raft.FSM) (*Node, error) {
 		})
 
 		if err := future.Error(); err != nil {
+			logger.LogError(fmt.Errorf("bootstrap raft cluster: %w", err))
 			node.Shutdown()
 			return nil, fmt.Errorf("bootstrap raft cluster: %w", err)
 		}
+		logger.LogRaft(fmt.Sprintf("event=bootstrap node=%q peers=%d result=success", cfg.NodeID, len(servers)))
 	}
 
+	logger.LogRaft(fmt.Sprintf("event=ready node=%q existing_state=%t", cfg.NodeID, hasState))
 	return node, nil
 }
 
@@ -179,6 +184,7 @@ func (n *Node) Shutdown() {
 	}
 
 	if n.Raft != nil {
+		logger.LogRaft("event=shutdown")
 		_ = n.Raft.Shutdown().Error()
 	}
 

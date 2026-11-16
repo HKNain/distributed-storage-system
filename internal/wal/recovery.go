@@ -1,10 +1,10 @@
-
 package wal
 
 import (
 	"fmt"
 
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 type UploadState string
@@ -186,6 +186,7 @@ func BuildRecoveryPlans(records []models.Record) (map[string]*UploadRecoveryPlan
 		}
 	}
 
+	logger.LogRecovery(fmt.Sprintf("event=recovery_plan files=%d result=success", len(plans)))
 	return plans, nil
 }
 

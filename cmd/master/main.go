@@ -37,8 +37,10 @@ func main() {
 
 	// Initialize logger.
 	if err := logger.Init(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Logger initialization failed:", err)
 	}
+
+	defer logger.Close()
 
 	// Database.
 	// Master-specific data directory.

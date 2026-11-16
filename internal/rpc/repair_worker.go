@@ -10,6 +10,7 @@ import (
 
 	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/HKNain/distributed-storage-system/internal/repository"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 	"github.com/HKNain/distributed-storage-system/internal/wal"
 )
 
@@ -69,13 +70,13 @@ func (w *RepairWorker) Run(ctx context.Context, interval time.Duration) {
 func (w *RepairWorker) processPending(ctx context.Context) {
 	records, err := w.walWriter.ReadAll()
 	if err != nil {
-		fmt.Printf("repair worker: failed to read WAL: %v\n", err)
+		logger.LogError(fmt.Errorf("repair worker read WAL: %w", err))
 		return
 	}
 
 	plans, err := wal.BuildRepairRecoveryPlans(records)
 	if err != nil {
-		fmt.Printf("repair worker: failed to build recovery plans: %v\n", err)
+		logger.LogError(fmt.Errorf("build repair recovery plans: %w", err))
 		return
 	}
 
@@ -89,12 +90,7 @@ func (w *RepairWorker) processPending(ctx context.Context) {
 		}
 
 		if err := w.repairChunk(ctx, plan); err != nil {
-			fmt.Printf(
-				"repair worker: chunk %s target %s: %v\n",
-				plan.ChunkID,
-				plan.TargetNodeID,
-				err,
-			)
+			logger.LogRecovery(fmt.Sprintf("event=repair chunk=%q target=%q result=failed error=%q", plan.ChunkID, plan.TargetNodeID, err))
 		}
 	}
 }

@@ -2,13 +2,14 @@ package rpc
 
 import (
 	"context"
-	"log"
-	"time"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	storagepb "github.com/HKNain/distributed-storage-system/api/proto"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -25,6 +26,7 @@ func RunHeartbeatClient(
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
+		logger.LogError(fmt.Errorf("connect heartbeat client to %s: %w", masterAddress, err))
 		return err
 	}
 	defer conn.Close()
@@ -46,24 +48,16 @@ func RunHeartbeatClient(
 		)
 
 		if err != nil {
-			log.Printf(
-				"Heartbeat failed for node %s: %v",
-				nodeID,
-				err,
-			)
+			logger.LogCluster(fmt.Sprintf("event=heartbeat node=%q master=%q result=failed error=%q", nodeID, masterAddress, err))
 			return
 		}
 
 		if !response.GetAccepted() {
-			log.Printf(
-				"Heartbeat rejected for node %s: %s",
-				nodeID,
-				response.GetMessage(),
-			)
+			logger.LogCluster(fmt.Sprintf("event=heartbeat node=%q master=%q result=rejected message=%q", nodeID, masterAddress, response.GetMessage()))
 			return
 		}
 
-		log.Printf("Heartbeat sent: Storage Node %s", nodeID)
+		logger.LogCluster(fmt.Sprintf("event=heartbeat node=%q master=%q result=accepted", nodeID, masterAddress))
 	}
 
 	// Register immediately instead of waiting for the first ticker event.
@@ -75,7 +69,7 @@ func RunHeartbeatClient(
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Heartbeat client stopped for node %s", nodeID)
+			logger.LogCluster(fmt.Sprintf("event=heartbeat node=%q result=stopped", nodeID))
 			return nil
 
 		case <-ticker.C:
@@ -85,45 +79,41 @@ func RunHeartbeatClient(
 }
 
 func RunHeartbeatClients(
-    ctx context.Context,
-    masterAddresses []string,
-    nodeID string,
-    nodeAddress string,
+	ctx context.Context,
+	masterAddresses []string,
+	nodeID string,
+	nodeAddress string,
 ) error {
-    if len(masterAddresses) == 0 {
-        return errors.New("no master addresses configured")
-    }
+	if len(masterAddresses) == 0 {
+		return errors.New("no master addresses configured")
+	}
 
-    var wg sync.WaitGroup
+	var wg sync.WaitGroup
 
-    for _, address := range masterAddresses {
-        address = strings.TrimSpace(address)
-        if address == "" {
-            continue
-        }
+	for _, address := range masterAddresses {
+		address = strings.TrimSpace(address)
+		if address == "" {
+			continue
+		}
 
-        wg.Add(1)
+		wg.Add(1)
 
-        go func(masterAddress string) {
-            defer wg.Done()
+		go func(masterAddress string) {
+			defer wg.Done()
 
-            if err := RunHeartbeatClient(
-                ctx,
-                masterAddress,
-                nodeID,
-                nodeAddress,
-            ); err != nil {
-                log.Printf(
-                    "Heartbeat client failed for master %s: %v",
-                    masterAddress,
-                    err,
-                )
-            }
-        }(address)
-    }
+			if err := RunHeartbeatClient(
+				ctx,
+				masterAddress,
+				nodeID,
+				nodeAddress,
+			); err != nil {
+				logger.LogError(fmt.Errorf("heartbeat client failed for master %s: %w", masterAddress, err))
+			}
+		}(address)
+	}
 
-    <-ctx.Done()
-    wg.Wait()
+	<-ctx.Done()
+	wg.Wait()
 
-    return nil
+	return nil
 }

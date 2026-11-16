@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/HKNain/distributed-storage-system/internal/repository"
 	"github.com/HKNain/distributed-storage-system/internal/rpc"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 	"github.com/HKNain/distributed-storage-system/internal/wal"
 )
 
@@ -61,6 +61,8 @@ func (c *FileController) UploadFile(
 	fileSize int64,
 	reader io.Reader,
 ) (models.File, error) {
+	startedAt := time.Now()
+	logger.LogTransfer(logger.TransferEvent{Operation: "upload", FileID: fileName, StatusCode: http.StatusProcessing, Message: "started"})
 
 	if userID == "" || fileName == "" || reader == nil {
 		return models.File{}, fmt.Errorf("invalid upload parameters")
@@ -274,12 +276,7 @@ func (c *FileController) UploadFile(
 					replica.NodeID,
 				)
 				if clientErr != nil {
-					log.Printf(
-						"upload fallback unavailable: chunk=%s node=%s: %v",
-						metadata.ID,
-						replica.NodeID,
-						clientErr,
-					)
+					logger.LogReplication(fmt.Sprintf("event=upload_fallback chunk=%q node=%q result=unavailable error=%q", metadata.ID, replica.NodeID, clientErr))
 					continue
 				}
 
@@ -289,12 +286,7 @@ func (c *FileController) UploadFile(
 					chunk.Data,
 					metadata.Hash,
 				); storeErr != nil {
-					log.Printf(
-						"upload fallback failed: chunk=%s node=%s: %v",
-						metadata.ID,
-						replica.NodeID,
-						storeErr,
-					)
+					logger.LogReplication(fmt.Sprintf("event=upload_fallback chunk=%q node=%q result=failed error=%q", metadata.ID, replica.NodeID, storeErr))
 					continue
 				}
 
@@ -328,12 +320,7 @@ func (c *FileController) UploadFile(
 					primary.NodeID,
 					"PRIMARY_UNAVAILABLE",
 				); repairErr != nil {
-					log.Printf(
-						"failed to schedule primary repair: chunk=%s node=%s: %v",
-						metadata.ID,
-						primary.NodeID,
-						repairErr,
-					)
+					logger.LogError(fmt.Errorf("schedule primary repair for chunk %s on node %s: %w", metadata.ID, primary.NodeID, repairErr))
 				}
 			}
 		}
@@ -345,11 +332,7 @@ func (c *FileController) UploadFile(
 		firstReplicaID := replicaNodes[0].NodeID
 
 		if fallbackReplicaID == firstReplicaID {
-			log.Printf(
-				"replica write completed during primary fallback: chunk=%s node=%s",
-				metadata.ID,
-				firstReplicaID,
-			)
+			logger.LogReplication(fmt.Sprintf("event=replica_write chunk=%q node=%q result=success source=fallback", metadata.ID, firstReplicaID))
 		} else if err := c.replicationManager.ReplicateToNode(
 			ctx,
 			firstReplicaID,
@@ -364,12 +347,7 @@ func (c *FileController) UploadFile(
 					Status: models.ReplicaStatusFailed,
 				},
 			)
-			log.Printf(
-				"replica write deferred: chunk=%s node=%s: %v",
-				metadata.ID,
-				firstReplicaID,
-				err,
-			)
+			logger.LogReplication(fmt.Sprintf("event=replica_write chunk=%q node=%q result=deferred error=%q", metadata.ID, firstReplicaID, err))
 
 		} else {
 			// 7. Persist the successful replica write.
@@ -447,9 +425,17 @@ func (c *FileController) UploadFile(
 	// Completed uploads no longer need their source staging file.
 	if err := os.Remove(stagingPath); err != nil {
 		// Do not fail an otherwise successful upload because cleanup failed.
-		fmt.Printf("warning: could not remove staging file %s: %v\n", stagingPath, err)
+		logger.LogError(fmt.Errorf("remove staging file %s: %w", stagingPath, err))
 	}
 
+	logger.LogTransfer(logger.TransferEvent{
+		Operation:  "upload",
+		FileID:     file.ID,
+		StatusCode: http.StatusCreated,
+		Bytes:      file.Size,
+		Duration:   time.Since(startedAt),
+		Message:    "completed",
+	})
 	return file, nil
 }
 

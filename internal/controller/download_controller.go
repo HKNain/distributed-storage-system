@@ -12,18 +12,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/HKNain/distributed-storage-system/internal/middleware"
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 var (
-	ErrDownloadNotFound  = errors.New("file not found")
-	ErrFileNotAvailable  = errors.New("file is not available for download")
-	ErrFileIntegrity     = errors.New("file integrity verification failed")
+	ErrDownloadNotFound = errors.New("file not found")
+	ErrFileNotAvailable = errors.New("file is not available for download")
+	ErrFileIntegrity    = errors.New("file integrity verification failed")
 	ErrChunkUnavailable = errors.New("no valid chunk copy is available")
 )
 
@@ -32,6 +34,8 @@ func (c *FileController) DownloadFile(
 	userID string,
 	fileID string,
 ) (*models.File, *os.File, error) {
+	startedAt := time.Now()
+	logger.LogTransfer(logger.TransferEvent{Operation: "download", FileID: fileID, StatusCode: http.StatusProcessing, Message: "started"})
 	// Ensure the storage manager is initialized.
 	if c.storageManager == nil {
 		return nil, nil, errors.New("storage client manager is not initialized")
@@ -121,12 +125,7 @@ func (c *FileController) DownloadFile(
 
 		// Log which node supplied the chunk.
 		if sourceNodeID != chunk.StorageNodeID {
-			fmt.Printf(
-				"Chunk %s recovered from replica node %s (primary: %s)\n",
-				chunk.ID,
-				sourceNodeID,
-				chunk.StorageNodeID,
-			)
+			logger.LogRecovery(fmt.Sprintf("event=download_fallback chunk=%q source=%q primary=%q", chunk.ID, sourceNodeID, chunk.StorageNodeID))
 		}
 
 		// Write verified chunk to temporary file.
@@ -166,6 +165,14 @@ func (c *FileController) DownloadFile(
 		return cleanup(err)
 	}
 
+	logger.LogTransfer(logger.TransferEvent{
+		Operation:  "download",
+		FileID:     fileID,
+		StatusCode: http.StatusOK,
+		Bytes:      totalSize,
+		Duration:   time.Since(startedAt),
+		Message:    "completed",
+	})
 	return &file, tempFile, nil
 }
 
@@ -201,9 +208,9 @@ func (fc *FileController) retrieveVerifiedChunk(
 	}
 
 	var (
-		healthyData   []byte
-		healthySource string
-		unhealthy     = make(map[string]string)
+		healthyData         []byte
+		healthySource       string
+		unhealthy           = make(map[string]string)
 		sawIntegrityFailure bool
 	)
 
@@ -249,22 +256,12 @@ func (fc *FileController) retrieveVerifiedChunk(
 	// Scheduling errors must not prevent a successful download.
 	for nodeID, reason := range unhealthy {
 		if fc.repairCoordinator == nil {
-			fmt.Printf(
-				"repair unavailable: coordinator not initialized (chunk=%s target=%s reason=%s)\n",
-				chunk.ID,
-				nodeID,
-				reason,
-			)
+			logger.LogRecovery(fmt.Sprintf("event=repair chunk=%q target=%q result=unavailable reason=%q", chunk.ID, nodeID, reason))
 			continue
 		}
 
 		if err := fc.repairCoordinator.ScheduleRepair(chunk, nodeID, reason); err != nil {
-			fmt.Printf(
-				"failed to schedule repair (chunk=%s target=%s): %v\n",
-				chunk.ID,
-				nodeID,
-				err,
-			)
+			logger.LogError(fmt.Errorf("schedule repair for chunk %s on node %s: %w", chunk.ID, nodeID, err))
 		}
 	}
 
@@ -286,7 +283,6 @@ func (fc *FileController) retrieveVerifiedChunk(
 		chunk.ID,
 	)
 }
-
 
 // DownloadHandler handles HTTP file downloads.
 func (c *FileController) DownloadHandler(

@@ -14,6 +14,7 @@ import (
 	"github.com/HKNain/distributed-storage-system/internal/models"
 	"github.com/HKNain/distributed-storage-system/internal/repository"
 	"github.com/HKNain/distributed-storage-system/internal/rpc"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 	"github.com/HKNain/distributed-storage-system/internal/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -53,7 +54,7 @@ func (c *FileController) RecoverInterruptedUploads(ctx context.Context) error {
 			continue
 		}
 
-		fmt.Printf("Recovering interrupted upload: file=%s\n", fileID)
+		logger.LogRecovery(fmt.Sprintf("event=upload_recovery file=%q result=started", fileID))
 
 		if err := c.recoverUpload(ctx, plan); err != nil {
 			return fmt.Errorf("recover upload %s: %w", fileID, err)
@@ -381,19 +382,10 @@ func (c *FileController) recoverUpload(
 	}
 
 	if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
-		fmt.Printf(
-			"warning: could not remove recovered staging file %s: %v\n",
-			stagingPath,
-			err,
-		)
+		logger.LogError(fmt.Errorf("remove recovered staging file %s: %w", stagingPath, err))
 	}
 
-	fmt.Printf(
-		"Recovered upload: file=%s chunks=%d checksum=%s\n",
-		plan.FileID,
-		chunkCount,
-		fileChecksum,
-	)
+	logger.LogRecovery(fmt.Sprintf("event=upload_recovery file=%q chunks=%d result=success", plan.FileID, chunkCount))
 
 	return nil
 }

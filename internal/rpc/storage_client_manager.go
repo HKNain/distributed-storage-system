@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 var (
@@ -160,11 +162,7 @@ func (m *StorageClientManager) Close() {
 
 	for nodeID, managed := range m.clients {
 		if err := managed.client.Close(); err != nil {
-			fmt.Printf(
-				"Failed to close storage client for %s: %v\n",
-				nodeID,
-				err,
-			)
+			logger.LogError(fmt.Errorf("close storage client for %s: %w", nodeID, err))
 		}
 
 		delete(m.clients, nodeID)

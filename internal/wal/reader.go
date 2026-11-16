@@ -1,4 +1,3 @@
-
 package wal
 
 import (
@@ -8,6 +7,7 @@ import (
 	"io"
 
 	"github.com/HKNain/distributed-storage-system/internal/models"
+	"github.com/HKNain/distributed-storage-system/internal/utils"
 )
 
 // ReadAll returns all valid WAL records in sequence order.
@@ -76,5 +76,6 @@ func (w *Writer) ReadAll() ([]models.Record, error) {
 		expectedSequence++
 	}
 
+	logger.LogRecovery(fmt.Sprintf("event=wal_read records=%d result=success", len(records)))
 	return records, nil
 }
